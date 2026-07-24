@@ -24,6 +24,19 @@ from papercuts.pypercuts import Papercutter, insert_muxes
 from papercuts.status import StatusWriter
 
 
+# Cut-family names, matching the prefix of each cut's type string from
+# Papercutter.cut_info() (the token before the first '('): "bitshrink",
+# "ternary(...)", "if(...)", "case(...)", "binop(...)". Used by --only-families
+# to restrict which families get scheduled/consolidated. Keep in sync with the
+# emplace_back type strings in cpp/src/papercuts.cpp (cutInfo).
+CUT_FAMILIES = ("bitshrink", "ternary", "if", "case", "binop")
+
+
+def cut_family(ctype: str) -> str:
+    """Family name for a cut type string, e.g. 'binop(and,keep-left)' -> 'binop'."""
+    return ctype.split("(", 1)[0]
+
+
 # MARK: Module context
 @dataclass
 class ModuleCuts:
@@ -351,6 +364,16 @@ async def main():
         "(e.g. generate-loop junk like '0 * 10') to their folded value "
         "(default: on; use --no-fold-constants to emit the raw arithmetic).",
     )
+    parser.add_argument(
+        "--only-families",
+        metavar="LIST",
+        default=None,
+        help="Comma-separated list of cut families to enumerate/check; all "
+        "others are skipped entirely (not scheduled, not consolidated). Valid "
+        f"families: {', '.join(CUT_FAMILIES)}. E.g. '--only-families bitshrink' "
+        "does only (iterative) bit-shrinks; '--only-families bitshrink,binop' "
+        "does both. Default: all families.",
+    )
 
     # Two-phase parse: resolve the backend, let it add its own args, then parse.
     args, _ = parser.parse_known_args()
@@ -359,6 +382,19 @@ async def main():
     args = parser.parse_args()
 
     set_verbose(args.verbose)
+
+    # Resolve --only-families into a set (None = all families). Validate names up
+    # front so a typo fails fast instead of silently selecting zero cuts.
+    only_families: set[str] | None = None
+    if args.only_families is not None:
+        requested = [f.strip() for f in args.only_families.split(",") if f.strip()]
+        unknown = [f for f in requested if f not in CUT_FAMILIES]
+        if unknown:
+            parser.error(
+                f"--only-families: unknown family {unknown} "
+                f"(valid: {', '.join(CUT_FAMILIES)})"
+            )
+        only_families = set(requested)
 
     backend = backend_cls.from_args(args) if args.check_equivalence else None
 
@@ -659,6 +695,11 @@ async def main():
             baseline=print_tree(ntree),
         )
         for idx in range(len(cut_infos)):
+            # --only-families: skip cuts outside the selected families. They are
+            # never scheduled, logged, or consolidated (everything downstream is
+            # driven by mod.runs).
+            if only_families is not None and cut_family(cut_infos[idx][0]) not in only_families:
+                continue
             run = Run(
                 top_module_path=f"{ctree_dir}/{top_name}.sv",
                 spec_lib_path=ctree_dir,
