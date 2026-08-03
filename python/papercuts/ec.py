@@ -318,6 +318,13 @@ def _parse_verdict(output: str, returncode: int) -> str:
     ``__PC_VERDICT__:<res>`` (or ``:error`` on a caught exception); if the marker
     is absent (e.g. the tool was killed before it printed), fall back to the exit
     code so a crashed/aborted run is still recorded as an error rather than lost.
+
+    The vocabulary the prover reports is wider than it first appears. A proof
+    only returns "proven" when *every* property has that same status; a run that
+    completed with a mix (i.e. at least one refutation) returns "determined"
+    instead. Reading only "cex" therefore files ordinary refuted cuts under
+    "error", which reads as a broken environment rather than a working check
+    that said no. Anything genuinely unrecognized still falls through to "error".
     """
     raw = None
     for line in output.splitlines():
@@ -325,12 +332,21 @@ def _parse_verdict(output: str, returncode: int) -> str:
             raw = line[len(_VERDICT_MARKER):].strip().lower()
     if raw is None:
         return "proven" if returncode == 0 else "error"
-    if raw == "proven":
+    if raw in ("proven", "marked_proven"):
         return "proven"
-    if raw in ("cex", "falsified", "disproven", "not_proven", "not-proven"):
+    # Fully decided, and not all-proven => at least one property was refuted.
+    if raw in ("cex", "ar_cex", "determined", "ar_determined",
+               "falsified", "disproven", "not_proven", "not-proven"):
         return "cex"
-    if raw in ("inconclusive", "undetermined", "unknown"):
+    # Ran, but did not decide everything -- the cut is unusable either way, and
+    # the distinction from a refutation is worth keeping (it is a budget/effort
+    # problem, not a design difference).
+    if raw in ("inconclusive", "undetermined", "unknown", "unprocessed",
+               "determined_or_skipped", "time_limit", "per_property_time_limit",
+               "max_trace_length"):
         return "inconclusive"
+    # Everything else (setup problems and aborts: overconstrained, out_of_memory,
+    # aborted, failed, no_properties, stopped_by_user, ...) stays an error.
     return "error"
 
 

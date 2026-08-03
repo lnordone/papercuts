@@ -15,7 +15,7 @@ deduplicates identical instance bodies, so a hierarchical reference into the
 resolves, because pyslang exposes each instance.
 
 Library entry point (used by the papercuts pipeline):
-    elaborate(files, *, flatten=True, ignore=(), allow_missing=False) -> str
+    elaborate(files, *, flatten=True, ignore=()) -> str
     elaborate_design(...) -> ElaboratedDesign   # same, plus the top module name
 
 CLI:
@@ -44,6 +44,7 @@ from dataclasses import dataclass
 import pyslang
 from pyslang.ast import ASTContext, Compilation, InstanceSymbol, LookupLocation
 from pyslang.syntax import SyntaxTree
+from pyslang.parsing import PreprocessorOptions
 
 INDENT = "    "
 
@@ -124,11 +125,6 @@ class Emitter:
         # Populated by run(): the module names actually emitted verbatim -- the
         # ignored definitions plus their whole subtree (the opaque region).
         self.verbatim = set()
-        # Populated during emission: definition names with no available body
-        # (only reachable under allow_missing). These become black boxes at the
-        # FV tool -- an opaque, unconstrained boundary on both the golden and
-        # elaborated sides (both derive from the same incomplete file list).
-        self.blackboxed = set()
         # symbol.hierarchicalPath -> flattened path ("stage_1.partial" scoped,
         # "stage_1_partial" flattened). Keyed by hierarchicalPath (not id()):
         # pyslang returns a fresh Python wrapper per access, so object identity
@@ -411,8 +407,6 @@ class Emitter:
             self._emit_generate_block(m)
         elif k == "Subroutine":
             self._emit_subroutine(m)
-        elif k == "UninstantiatedDef":
-            self._emit_uninstantiated_def(m)
         elif k == "WildcardImport":
             self.emit(f"import {m.packageName}::*;")
         elif k == "ExplicitImport":
@@ -516,38 +510,6 @@ class Emitter:
         self.level -= 1
         self.emit(");")
 
-    def _emit_uninstantiated_def(self, u):
-        # A submodule with no available definition (only reachable when compiled
-        # with --allow-missing-modules). It cannot be elaborated, so its port
-        # connections and parameter values are unresolved in the AST. We re-emit
-        # the instantiation from its source syntax instead. Note: connections
-        # are taken verbatim from source, so --flatten renaming is NOT applied to
-        # them -- a black box wired to a hoisted/renamed generate signal would
-        # need manual fixup (uncommon; black boxes usually sit at module scope).
-        self.blackboxed.add(u.definitionName)
-        parts = [u.definitionName]
-        params = self._uninst_params_text(u)
-        if params:
-            parts.append(params)
-        text = str(u.syntax).strip()  # "u_y (.a(din), .b(w), .c(o))"
-        if self.flatten:
-            mangled = self.path_map.get(u.hierarchicalPath)
-            if mangled and text.startswith(u.name):
-                # Rewrite only the leading instance-name token so hoisting a
-                # black box out of a generate scope doesn't collide with its
-                # siblings. (Connection operands stay verbatim -- see note above.)
-                text = mangled + text[len(u.name):]
-        parts.append(text)
-        self.emit(" ".join(parts) + ";")
-
-    def _uninst_params_text(self, u):
-        node = getattr(getattr(u, "syntax", None), "parent", None)
-        while node is not None and "HierarchyInstantiation" not in type(node).__name__:
-            node = getattr(node, "parent", None)
-        if node is not None and getattr(node, "parameters", None) is not None:
-            return str(node.parameters).strip()
-        return ""
-
     def _port_conn_expr(self, conn):
         ex = conn.expression
         if ex is None:
@@ -571,8 +533,6 @@ class Emitter:
                 out[m.hierarchicalPath] = prefix + m.name
                 self._build_path_map(list(m.body), prefix + m.name + ".",
                                      out, gen_sep)
-            elif k == "UninstantiatedDef":
-                out[m.hierarchicalPath] = prefix + m.name
             elif k == "GenerateBlockArray":
                 for idx, blk in self._array_blocks(m):
                     label = self._gen_block_label(blk, array_name=m.name, index=idx)
@@ -1049,27 +1009,40 @@ class Emitter:
         return str(value)
 
 
-def build_compilation(files, allow_missing=False):
-    comp = _new_compilation(allow_missing)
+# A Compilation references its trees' SourceManager for its whole lifetime. When
+# we build trees with an explicitly-created SourceManager (to add include dirs /
+# predefines), that Python object must outlive the Compilation -- if it is GC'd,
+# the C++ side dangles and elaboration misfires (spurious UnknownModule errors or
+# hangs). Hold a reference for the process lifetime; one tiny env per elaboration.
+_PARSE_ENV_KEEPALIVE: list = []
+
+
+def make_parse_env(incdirs=(), defines=()):
+    """Build a shared SourceManager + options Bag for `include / macro support.
+
+    ``incdirs`` are added as user include-search directories (the equivalent of
+    ``+incdir``); ``defines`` is a list of ``"NAME"`` or ``"NAME=VALUE"`` strings
+    predefined before preprocessing (the equivalent of ``+define``). One shared
+    SourceManager across every file keeps source locations consistent for
+    diagnostics. With no incdirs/defines this is equivalent to a plain parse.
+    """
+    sm = pyslang.SourceManager()
+    for d in incdirs:
+        sm.addUserDirectories(d)
+    pp = PreprocessorOptions()
+    if defines:
+        pp.predefines = list(defines)
+    opts = pyslang.Bag([pp])
+    _PARSE_ENV_KEEPALIVE.append((sm, opts))  # keep alive for the Compilation
+    return sm, opts
+
+
+def build_compilation(files, incdirs=(), defines=()):
+    comp = Compilation()
+    sm, opts = make_parse_env(incdirs, defines)
     for path in files:
-        comp.addSyntaxTree(SyntaxTree.fromFile(path))
+        comp.addSyntaxTree(SyntaxTree.fromFile(path, sm, opts))
     return comp
-
-
-def _new_compilation(allow_missing):
-    if not allow_missing:
-        return Compilation()
-    # Ignore instantiations of modules that have no available definition; they
-    # become UninstantiatedDefSymbols the emitter re-emits from source syntax.
-    try:
-        from pyslang.ast import CompilationOptions, CompilationFlags
-        opts = CompilationOptions()
-        opts.flags = CompilationFlags.IgnoreUnknownModules
-        return Compilation(pyslang.Bag([opts]))
-    except Exception as e:  # pragma: no cover - version-dependent API
-        print(f"Error: could not enable --allow-missing-modules on this pyslang "
-              f"build ({type(e).__name__}: {e}).", file=sys.stderr)
-        raise
 
 
 def report_diagnostics(comp):
@@ -1128,11 +1101,10 @@ class ElaboratedDesign:
     top: str               # top module name (empty if there is no top instance)
     tops: list             # all top-instance names (usually exactly one)
     verbatim: set          # module names emitted verbatim (the opaque/uncut region)
-    blackboxed: set        # missing-definition module names (opaque FV boundaries)
 
 
-def elaborate_design(files, *, flatten=True, ignore=(), allow_missing=False,
-                     fold_constants=True):
+def elaborate_design(files, *, flatten=True, ignore=(),
+                     fold_constants=True, incdirs=(), defines=()):
     """Elaborate ``files`` and re-emit the whole design as one source blob.
 
     ``ignore`` accepts fnmatch globs or bare names; matching module definitions
@@ -1146,7 +1118,7 @@ def elaborate_design(files, *, flatten=True, ignore=(), allow_missing=False,
 
     Returns an :class:`ElaboratedDesign` carrying the source and the top module
     name (the pipeline needs the top to wire the elaborated-vs-original gate)."""
-    comp = build_compilation(files, allow_missing=allow_missing)
+    comp = build_compilation(files, incdirs=incdirs, defines=defines)
     if report_diagnostics(comp):
         raise ElaborationError("input has compilation errors; aborting")
 
@@ -1162,20 +1134,19 @@ def elaborate_design(files, *, flatten=True, ignore=(), allow_missing=False,
         top=tops[0] if tops else "",
         tops=tops,
         verbatim=set(emitter.verbatim),
-        blackboxed=set(emitter.blackboxed),
     )
 
 
-def elaborate(files, *, flatten=True, ignore=(), allow_missing=False,
-              fold_constants=True) -> str:
+def elaborate(files, *, flatten=True, ignore=(),
+              fold_constants=True, incdirs=(), defines=()) -> str:
     """Elaborate ``files`` and return the re-emitted design as a string.
 
     Thin wrapper over :func:`elaborate_design` for callers that only need the
     source text (the CLI). Use ``elaborate_design`` when you also need the top
     module name (e.g. to wire the elaborated-vs-original equivalence gate)."""
     return elaborate_design(
-        files, flatten=flatten, ignore=ignore, allow_missing=allow_missing,
-        fold_constants=fold_constants,
+        files, flatten=flatten, ignore=ignore,
+        fold_constants=fold_constants, incdirs=incdirs, defines=defines,
     ).source
 
 
@@ -1197,15 +1168,18 @@ def main():
         "emitted verbatim too). Accepts fnmatch globs (e.g. 'lib_*'). Repeatable.",
     )
     parser.add_argument(
-        "--allow-missing-modules", action="store_true",
-        help="treat instantiations of undefined modules as black boxes "
-        "(re-emitted from source) instead of erroring",
-    )
-    parser.add_argument(
         "--fold-constants", action=argparse.BooleanOptionalAction, default=True,
         help="resolve fully-constant subexpressions (e.g. generate-loop junk "
         "like '0 * 10') to their folded value (default: on; use "
         "--no-fold-constants to emit the raw arithmetic)",
+    )
+    parser.add_argument(
+        "-I", "--incdir", action="append", default=[], metavar="DIR",
+        help="add an include-search directory (like +incdir). Repeatable.",
+    )
+    parser.add_argument(
+        "-D", "--define", action="append", default=[], metavar="NAME[=VALUE]",
+        help="predefine a macro before preprocessing (like +define). Repeatable.",
     )
     args = parser.parse_args()
 
@@ -1214,8 +1188,9 @@ def main():
             args.files,
             flatten=args.flatten,
             ignore=args.ignore,
-            allow_missing=args.allow_missing_modules,
             fold_constants=args.fold_constants,
+            incdirs=args.incdir,
+            defines=args.define,
         )
     except (ElaborationError, EmitError) as e:
         print(f"Error: {e}", file=sys.stderr)
