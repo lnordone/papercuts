@@ -1037,12 +1037,18 @@ def make_parse_env(incdirs=(), defines=()):
     return sm, opts
 
 
-def build_compilation(files, incdirs=(), defines=()):
+def build_compilation_from(trees):
+    """Compilation over already-parsed trees, so callers holding them re-use rather
+    than re-parse. The trees' SourceManager must outlive the Compilation."""
     comp = Compilation()
-    sm, opts = make_parse_env(incdirs, defines)
-    for path in files:
-        comp.addSyntaxTree(SyntaxTree.fromFile(path, sm, opts))
+    for tree in trees:
+        comp.addSyntaxTree(tree)
     return comp
+
+
+def build_compilation(files, incdirs=(), defines=()):
+    sm, opts = make_parse_env(incdirs, defines)
+    return build_compilation_from(SyntaxTree.fromFile(p, sm, opts) for p in files)
 
 
 def report_diagnostics(comp):

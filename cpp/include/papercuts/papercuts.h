@@ -269,9 +269,18 @@ private:
     bool allowSigned;   // Signed decls are only shrinkable when narrowing in place (not with intermediate wires)
     bool allowNets;     // Net decls (wire/tri/...) are only shrinkable when narrowing in place
     bool allowMultiDim; // Multi-packed-dim vectors are only shrinkable when narrowing in place
+    // Signal name -> the (left, right) its packed range actually evaluates to, for
+    // ranges whose bounds are not literals (`[WIDTH-1:0]`). Such a dimension is
+    // only shrinkable when these are known: they give both its true width and,
+    // crucially, its direction. A reversed range is legal SV -- `[W-1:0]` with a
+    // placeholder `parameter W = 0` is `[-1:0]`, a 2-bit range whose *left* is the
+    // low end -- so subtracting from the symbolic bound would silently widen it.
+    std::unordered_map<std::string, std::pair<int, int>> symbolicRanges;
 public:
-    BitShrinkCollector(bool allowSigned = false, bool allowNets = false, bool allowMultiDim = false)
-        : allowSigned(allowSigned), allowNets(allowNets), allowMultiDim(allowMultiDim) {}
+    BitShrinkCollector(bool allowSigned = false, bool allowNets = false, bool allowMultiDim = false,
+                       std::unordered_map<std::string, std::pair<int, int>> symbolicRanges = {})
+        : allowSigned(allowSigned), allowNets(allowNets), allowMultiDim(allowMultiDim),
+          symbolicRanges(std::move(symbolicRanges)) {}
     void handle(const DeclaratorSyntax&);
     std::vector<BitShrinkTarget> getFoundNodes(const std::shared_ptr<SyntaxTree>);
 };
@@ -464,8 +473,13 @@ private:
     void selectCuts(const std::vector<size_t>& indicesToCut,
                     const std::unordered_map<size_t, int>& amounts = {});
 public:
+    // `symbolicRanges` maps signal name -> the (left, right) its packed range
+    // evaluates to, enabling bit-shrink on declarations whose range is
+    // parameterized (`logic [WIDTH-1:0] x;`). Empty (the default) keeps such
+    // declarations uncut.
     Papercutter(const std::shared_ptr<SyntaxTree> tree, bool shrinkWithIntermediate = false,
-                bool binopsInConditionsOnly = false);
+                bool binopsInConditionsOnly = false,
+                std::unordered_map<std::string, std::pair<int, int>> symbolicRanges = {});
     std::vector<std::shared_ptr<SyntaxTree>> cutAll();
     // `amounts`: optional per-bitshrink-index override of the number of bits to
     // drop (default 1). Enables iterative multi-bit shrinking; other cut families

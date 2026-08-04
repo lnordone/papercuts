@@ -61,6 +61,31 @@ python -m papercuts <input_files.sv> [options]
 - `input_files` - Path to the input SystemVerilog files (required)
 - `-m, --mux-rewrites` - Also produce muxed versions of designs
 - `-e, --check-equivalence` - Run formal equivalence checks (requires JasperGold)
+- `--in-situ` - Cut the original source in place (see below)
+- `--top NAME` - Name the design top, so `--in-situ` needs no elaboration at all
+
+### In-situ mode
+
+By default papercuts elaborates the design first: parameters are concretized,
+generate loops unrolled, and a module instantiated N times becomes N specialized
+copies, each cut independently. `--in-situ` skips all of that and cuts the
+original parameterized source, so the outputs are edits you can apply to the
+design as written.
+
+Because a definition stays shared by all its instances, every cut must hold for
+each instantiation. The equivalence check enforces that for free -- it elaborates
+at the design top either way -- so in-situ produces fewer but directly
+source-actionable cuts.
+
+Bit-shrink still works on parameterized ranges (`logic [WIDTH-1:0] x;` becomes
+`logic [(WIDTH-1)-1:0] x;`). Syntax alone does not say how wide such a range is
+or which way it runs, and both matter -- a reversed range is legal SV, so
+narrowing the wrong end widens the signal instead of erroring. A read-only
+elaboration supplies the bounds each range really evaluates to; it only reads the
+design and never rewrites it. Passing `--top` makes it optional, so a design that
+cannot be elaborated at all is still cuttable -- parameterized bit-shrinks are
+then skipped and the other cut families are unaffected.
+
 ## Output
 
 The tool generates:

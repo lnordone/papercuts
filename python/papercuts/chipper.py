@@ -45,6 +45,44 @@ def concretized_definition_names(comp: Compilation) -> dict[str, str]:
     }
 
 
+def definition_signal_ranges(comp: Compilation) -> dict[str, dict[str, tuple[int, int]]]:
+    """Map each module definition to ``{signal name: (left, right)}`` -- the bounds
+    its packed range actually evaluates to.
+
+    Feeds ``Papercutter(symbolic_ranges=...)``, which cannot bit-shrink a
+    parameterized declaration (``logic [WIDTH-1:0] x;``) from syntax alone: the
+    bounds give neither a width to stop at nor a direction to shrink in. Both
+    matter, because a reversed range is legal SV -- a placeholder ``parameter
+    WIDTH = 0`` makes that declaration ``[-1:0]``, two bits wide with its *left*
+    as the low end -- so narrowing the wrong end silently widens the signal.
+
+    A definition instantiated with different parameters has a different range per
+    instance; the narrowest is kept, since an in-situ cut edits the one shared
+    definition and so must be valid for every instance of it.
+    """
+    ranges: dict[str, dict[str, tuple[int, int]]] = {}
+
+    def _scope(scope, out: dict[str, tuple[int, int]]) -> None:
+        for m in scope:
+            if isinstance(m, ast.InstanceSymbol):
+                continue  # child definitions are visited on their own
+            if isinstance(m, (ast.VariableSymbol, ast.NetSymbol)):
+                if m.type.isIntegral and m.type.isPackedArray:
+                    r = m.type.fixedRange
+                    cur = out.get(m.name)
+                    if cur is None or abs(r.left - r.right) < abs(cur[0] - cur[1]):
+                        out[m.name] = (r.left, r.right)
+            elif hasattr(m, "__iter__"):
+                _scope(m, out)  # generate/named blocks declare signals too
+
+    def _visitor(obj: Union[Token, SyntaxNode]) -> None:
+        if isinstance(obj, ast.InstanceSymbol):
+            _scope(obj.body, ranges.setdefault(obj.definition.name, {}))
+
+    comp.getRoot().visit(_visitor)
+    return ranges
+
+
 def collect_modules_cst(comp: Compilation) -> dict[str, SyntaxTree]:
     """Collects all module instances from the given compilation and returns a dictionary mapping their hierarchical paths (string) to their syntax trees."""
     modules = {}

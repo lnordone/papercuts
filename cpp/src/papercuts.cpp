@@ -1,6 +1,7 @@
 #include "papercuts/papercuts.h"
 
 #include "papercuts/utils.h"
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -22,6 +23,32 @@ using namespace slang::syntax;
 using namespace slang::parsing;
 
 namespace papercuts {
+
+namespace {
+// How a packed range's bounds constrain a bit-shrink of that dimension.
+struct RangeBounds {
+    bool literal = false;                       // both bounds literal: `width` is exact
+    int width = 0;                              // only set when `literal`
+    const ExpressionSyntax* symbolic = nullptr; // the sole non-literal bound, if exactly one
+};
+
+// Classify `[a:b]`. The single non-literal bound is the MSB end in both
+// `[W-1:0]` and `[0:W-1]`, so narrowing it is direction-correct either way; a
+// range with two non-literal bounds has no inferable direction and is reported
+// as neither literal nor symbolic (i.e. not shrinkable).
+RangeBounds classifyRange(const RangeSelectSyntax& sel) {
+    auto* left = sel.left->as_if<LiteralExpressionSyntax>();
+    auto* right = sel.right->as_if<LiteralExpressionSyntax>();
+    if (left && right) {
+        int l = tokenToInt(left->literal), r = tokenToInt(right->literal);
+        return {true, std::abs(l - r) + 1, nullptr};
+    }
+    if (!left && !right)
+        return {};
+    return {false, 0, left ? sel.right : sel.left};
+}
+} // namespace
+
 void ModuleNameRewriter::handle(const ModuleHeaderSyntax& node) {
     auto pstring = persistString(this->alloc, this->newName);
     auto newToken = this->makeToken(TokenKind::Identifier, pstring);
@@ -419,23 +446,39 @@ void BitShrinkCollector::handle(const DeclaratorSyntax& node) {
     // dimension independently ([3:0][7:0] -> a cut for [3:0] and a cut for [7:0]);
     // single-dim mode only ever sees one dimension here.
     for (size_t di = 0; di < dims->size(); ++di) {
-        // Only simple literal ranges are shrinkable. Anything else (wildcard/queue
-        // dimensions, or bounds concretization left non-literal) is skipped per
-        // dimension rather than throwing, so the other dimensions still yield cuts.
+        // Non-range dimensions (wildcard/queue) are skipped per dimension rather
+        // than throwing, so the other dimensions still yield cuts.
         auto* dimSpec = (*dims)[di]->specifier->as_if<RangeDimensionSpecifierSyntax>();
         if (!dimSpec)
             continue;
         auto* dimSelect = dimSpec->selector->as_if<RangeSelectSyntax>();
         if (!dimSelect)
             continue;
-        auto* left = dimSelect->left->as_if<LiteralExpressionSyntax>();
-        auto* right = dimSelect->right->as_if<LiteralExpressionSyntax>();
-        if (!left || !right)
-            continue;
 
-        int leftVal = tokenToInt(left->literal);
-        int rightVal = tokenToInt(right->literal);
-        int width = std::abs(leftVal - rightVal) + 1;
+        // A literal range carries its own width; a parameterized one (`[WIDTH-1:0]`)
+        // is only shrinkable when the caller supplied what it evaluates to.
+        auto bounds = classifyRange(*dimSelect);
+        int width = bounds.width;
+        if (!bounds.literal) {
+            // symbolicRanges is keyed by signal, so it describes the signal's whole
+            // packed range -- which is the dimension's range only when there is
+            // exactly one. Multi-dim parameterized vectors are left uncut rather
+            // than shrunk against a width that is really a product of dimensions.
+            if (!bounds.symbolic || dims->size() != 1)
+                continue;
+            auto it = symbolicRanges.find(std::string(node.name.valueText()));
+            if (it == symbolicRanges.end())
+                continue;
+            auto [l, r] = it->second;
+            // Removing bits means moving the range's HIGH end inward, so the
+            // symbolic bound has to be that end. It usually is (`[W-1:0]` and
+            // `[0:W-1]` alike), but not for a reversed range such as the `[-1:0]`
+            // a placeholder `parameter W = 0` produces -- there the symbolic left
+            // is the LOW end, and subtracting from it would widen the signal.
+            if ((bounds.symbolic == dimSelect->left) != (l > r))
+                continue;
+            width = std::abs(l - r) + 1;
+        }
 
         if (width <= 1) {
             continue;
@@ -822,13 +865,17 @@ std::vector<std::pair<const BinaryExpressionSyntax*, bool>> BinopCollector::getF
 // MARK: Papercutter
 
 Papercutter::Papercutter(const std::shared_ptr<SyntaxTree> tree, bool shrinkWithIntermediate,
-                         bool binopsInConditionsOnly)
+                         bool binopsInConditionsOnly,
+                         std::unordered_map<std::string, std::pair<int, int>> symbolicRanges)
     : tree(tree), shrinkWithIntermediate(shrinkWithIntermediate),
       binopsInConditionsOnly(binopsInConditionsOnly) {
 
-    // Narrow (default) mode can shrink signed decls, nets, and multi-packed-dim
-    // vectors; intermediate-wire mode cannot.
-    BitShrinkCollector BSC(!shrinkWithIntermediate, !shrinkWithIntermediate, !shrinkWithIntermediate);
+    // Narrow (default) mode can shrink signed decls, nets, multi-packed-dim
+    // vectors, and parameterized ranges; intermediate-wire mode cannot.
+    if (shrinkWithIntermediate)
+        symbolicRanges.clear();
+    BitShrinkCollector BSC(!shrinkWithIntermediate, !shrinkWithIntermediate, !shrinkWithIntermediate,
+                           std::move(symbolicRanges));
     shrinkNodes = BSC.getFoundNodes(tree);
     cutCount += shrinkNodes.size();
     BSRCount = shrinkNodes.size();
@@ -1138,37 +1185,43 @@ std::string trimWs(std::string s) {
     return s.substr(b, e - b + 1);
 }
 
-// Build the packed-range string for a declaration's shared type, dropping one bit
-// off the high end of every dimension whose index is in `narrowIdx`. e.g. dims
-// [3:0][7:0] with narrowIdx={1} -> "[3:0][6:0]". Non-narrowed dimensions are
-// emitted verbatim (via toString) so any bound form survives untouched; narrowed
-// dimensions are recomputed from their literal bounds (the collector only ever
-// targets simple literal ranges, so the casts here are safe).
+// Build the packed-range string for a declaration's shared type, narrowing every
+// dimension named in `narrow` by that target's `amount` bits. e.g. dims [3:0][7:0]
+// narrowed at dimIndex 1 by 1 -> "[3:0][6:0]". Dimensions not in `narrow` are
+// emitted verbatim (via toString) so any bound form survives untouched.
+//
+// A literal range is recomputed arithmetically; a parameterized one is narrowed
+// symbolically by subtracting from its non-literal bound ([WIDTH-1:0] -drop=2->
+// [(WIDTH-1)-2:0]). The target's `width` clamps the drop either way -- over-dropping
+// a symbolic range yields a reversed range like [-1:0], which is legal SV and
+// silently *widens* the signal rather than erroring.
 std::string buildPackedRanges(const SyntaxList<VariableDimensionSyntax>& dims,
-                              const std::unordered_map<int, int>& narrowAmt) {
+                              const std::vector<BitShrinkTarget>& narrow) {
     std::string out;
     for (size_t di = 0; di < dims.size(); ++di) {
-        auto it = narrowAmt.find(static_cast<int>(di));
-        if (it != narrowAmt.end()) {
-            auto& rsel = dims[di]->specifier->as<RangeDimensionSpecifierSyntax>().selector->as<RangeSelectSyntax>();
-            int leftVal = tokenToInt(rsel.left->as<LiteralExpressionSyntax>().literal);
-            int rightVal = tokenToInt(rsel.right->as<LiteralExpressionSyntax>().literal);
-            // Drop `amount` bits off the high end: [7:0] -amount=2-> [5:0],
-            // [0:7] -amount=2-> [0:5]. Clamp so the dimension keeps at least one
-            // bit (never shrink to a zero-width or reversed range).
-            int width = std::abs(leftVal - rightVal) + 1;
-            int drop = it->second;
-            if (drop < 1)
-                drop = 1;
-            if (drop > width - 1)
-                drop = width - 1;
-            if (leftVal >= rightVal)
-                leftVal -= drop;
-            else
-                rightVal -= drop;
-            out += "[" + std::to_string(leftVal) + ":" + std::to_string(rightVal) + "]";
-        } else {
+        auto it = std::find_if(narrow.begin(), narrow.end(),
+                               [&](const BitShrinkTarget& t) { return t.dimIndex == (int)di; });
+        if (it == narrow.end()) {
             out += trimWs(std::string(dims[di]->toString()));
+            continue;
+        }
+
+        auto& rsel = dims[di]->specifier->as<RangeDimensionSpecifierSyntax>().selector->as<RangeSelectSyntax>();
+        // Keep at least one bit: never shrink to a zero-width or reversed range.
+        int drop = std::clamp(it->amount, 1, std::max(1, it->width - 1));
+
+        if (auto bounds = classifyRange(rsel); bounds.literal) {
+            // [7:0] -drop=2-> [5:0]; [0:7] -drop=2-> [0:5].
+            int l = tokenToInt(rsel.left->as<LiteralExpressionSyntax>().literal);
+            int r = tokenToInt(rsel.right->as<LiteralExpressionSyntax>().literal);
+            (l >= r ? l : r) -= drop;
+            out += "[" + std::to_string(l) + ":" + std::to_string(r) + "]";
+        } else {
+            std::string sym = "(" + trimWs(std::string(bounds.symbolic->toString())) + ")-" +
+                              std::to_string(drop);
+            bool symIsLeft = bounds.symbolic == rsel.left;
+            out += "[" + (symIsLeft ? sym : trimWs(std::string(rsel.left->toString()))) + ":" +
+                   (symIsLeft ? trimWs(std::string(rsel.right->toString())) : sym) + "]";
         }
     }
     return out;
@@ -1239,13 +1292,9 @@ void Papercutter::handle(const DataDeclarationSyntax& node) {
         repls.push_back(s);
     }
     for (const auto* d : targeted) {
-        // The dimensions to narrow for this declarator (usually one; more if the
-        // caller combined several dim-cuts of the same signal in one tree), each
-        // with the number of bits to drop.
-        std::unordered_map<int, int> narrowAmt;
-        for (const auto& t : runMap[d])
-            narrowAmt[t.dimIndex] = t.amount;
-        repls.push_back(trivia + modsOut + typeHead + " " + buildPackedRanges(dims, narrowAmt) + " " +
+        // runMap[d] holds the dimensions to narrow for this declarator (usually
+        // one; more if the caller combined several dim-cuts of the same signal).
+        repls.push_back(trivia + modsOut + typeHead + " " + buildPackedRanges(dims, runMap[d]) + " " +
                         trimWs(std::string(d->toString())) + ";");
     }
 
@@ -1319,10 +1368,7 @@ void Papercutter::handle(const NetDeclarationSyntax& node) {
         repls.push_back(s);
     }
     for (const auto* d : targeted) {
-        std::unordered_map<int, int> narrowAmt;
-        for (const auto& t : runMap[d])
-            narrowAmt[t.dimIndex] = t.amount;
-        repls.push_back(trivia + typeHead + " " + buildPackedRanges(*dims, narrowAmt) + " " +
+        repls.push_back(trivia + typeHead + " " + buildPackedRanges(*dims, runMap[d]) + " " +
                         trimWs(std::string(d->toString())) + ";");
     }
 

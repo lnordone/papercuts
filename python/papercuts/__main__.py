@@ -16,7 +16,9 @@ import subprocess
 import asyncio
 
 import papercuts.chipper as chipper
-from papercuts.elaborator import elaborate_design, ElaborationError, EmitError, make_parse_env
+from papercuts.elaborator import (
+    elaborate_design, build_compilation_from, ElaborationError, EmitError, make_parse_env,
+)
 from papercuts.utils import print_tree, status, set_verbose, Run
 from papercuts.ec import generate_jasper_tcl_script
 from papercuts.backends import discover_backends, get_backend
@@ -361,6 +363,29 @@ async def main():
         help="Ignore the exclusions the selected backend recommends by default.",
     )
     parser.add_argument(
+        "--in-situ",
+        action="store_true",
+        help="Cut the original source in place: skip elaboration entirely, so "
+        "parameters are not concretized, generate loops are not unrolled, and a "
+        "module instantiated N times stays ONE definition instead of becoming N "
+        "specialized copies. Each cut therefore has to hold for every instance of "
+        "the definition it edits (the equivalence check enforces this for free, "
+        "since it elaborates at the design top), which yields fewer but "
+        "source-actionable cuts. A read-only elaboration is still used to find the "
+        "top and to learn signal widths for parameterized bit-shrinks; pass --top "
+        "to skip even that.",
+    )
+    parser.add_argument(
+        "--top",
+        default=None,
+        metavar="NAME",
+        help="Name of the design top. Only used with --in-situ, where it makes the "
+        "read-only elaboration optional: without it the top is discovered by "
+        "elaborating, with it a design that cannot be elaborated is still cuttable "
+        "(bit-shrinks on parameterized ranges are then skipped, since their real "
+        "widths are unknown).",
+    )
+    parser.add_argument(
         "--fold-constants",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -400,6 +425,10 @@ async def main():
             )
         only_families = set(requested)
 
+    if args.top and not args.in_situ:
+        parser.error("--top only applies to --in-situ; the elaborated front end "
+                     "discovers the top itself.")
+
     backend = backend_cls.from_args(args) if args.check_equivalence else None
 
     # Modules to keep in the golden source but never cut. Union of the user's
@@ -408,7 +437,8 @@ async def main():
     # names match exactly and globs (e.g. "lib_*") match families. These
     # patterns feed the elaborator's `ignore` (excluded modules are emitted
     # verbatim under their original names) and are matched again below, via
-    # is_excluded, against those same names to skip cutting them.
+    # is_excluded, against those same names to skip cutting them. Under
+    # --in-situ nothing is emitted or renamed, so they are only matched there.
     exclude_patterns: set[str] = set(args.exclude_module or [])
     if args.exclude_modules_file:
         with open(args.exclude_modules_file) as f:
@@ -452,77 +482,135 @@ async def main():
     # output dir was just recreated, so this always starts empty.
     results_path = f"{output_dir}/{RESULTS_FILENAME}"
 
-    # MARK: Elaboration -- the canonical front end.
-    # Unroll generates, resolve parameters, and flatten hierarchy up front by
-    # re-emitting the whole design from a live slang elaboration. Excluded
-    # modules are emitted verbatim (opaque boundaries) so they reach the formal
-    # tool as their original source and parents instantiate them by their
-    # original name. Everything downstream (the FV gate and the cut pipeline)
-    # treats the elaborated source as canonical -- chipper.eval_modules
-    # concretization is no longer part of the flow.
-    status("Elaborating design (unroll + flatten + concretize)...")
-    try:
-        elab = elaborate_design(args.input_files, flatten=True, ignore=exclude_patterns,
-                                fold_constants=args.fold_constants,
-                                incdirs=incdirs, defines=defines)
-    except (ElaborationError, EmitError) as e:
-        raise SystemExit(f"FATAL: elaboration failed: {e}")
-
-    if len(elab.tops) != 1:
-        raise SystemExit(
-            f"FATAL: expected exactly one top-level instance, got {elab.tops or 'none'}."
-        )
-    top_name = elab.top
-    status(f"Elaborated top: {top_name}")
-
-    # The elaborated whole-design source is a single self-contained blob (all
-    # specialized submodules + verbatim boundaries in one file). Keep it in its
-    # own dir so it never pollutes the original-source library used by the gate.
-    elab_dir = f"{output_dir}/elab"
-    os.makedirs(elab_dir, exist_ok=True)
-    elab_blob_path = f"{elab_dir}/{top_name}_elaborated.sv"
-    with open(elab_blob_path, "w") as f:
-        f.write(elab.source)
-
-    # The original design, split one module per file, is the golden ("spec") side
-    # of the elaboration-equivalence gate below.
+    # The original design, split one module per file: the golden ("spec") side of
+    # the elaboration-equivalence gate below, and -- under --in-situ -- the cut
+    # spec library itself. Every consumer resolves modules by file stem, so one
+    # definition per name is required.
     orig_dir = f"{output_dir}/orig"
     os.makedirs(orig_dir, exist_ok=True)
     orig_sm, orig_opts = make_parse_env(incdirs, defines)
-    for raw in (SyntaxTree.fromFile(f, orig_sm, orig_opts) for f in args.input_files):
+    raw_trees = [SyntaxTree.fromFile(f, orig_sm, orig_opts) for f in args.input_files]
+    orig_trees: list[tuple[SyntaxTree, str]] = []
+    defined_in: dict[str, str] = {}
+    for src, raw in zip(args.input_files, raw_trees):
         for name, tree in chipper.split_tree(raw):
+            if name in defined_in:
+                raise SystemExit(
+                    f"FATAL: module '{name}' is defined in both {defined_in[name]} "
+                    f"and {src}. Papercuts addresses modules by name; pass only one "
+                    f"definition of each (or exclude the duplicate)."
+                )
+            defined_in[name] = src
+            orig_trees.append((tree, name))
             with open(f"{orig_dir}/{name}.sv", "w") as f:
                 f.write(print_tree(tree))
 
-    # Canonical per-module sources = the elaborated blob, split one module per
-    # file. This replaces the old concretized-tree list and becomes the cut spec
-    # lib. split_tree yields (name, tree); the pipeline consumes (tree, name).
-    blob_tree = SyntaxTree.fromText(elab.source)
-    conc_trees = [(tree, name) for name, tree in chipper.split_tree(blob_tree)]
+    # `symbolic_ranges[def][signal]` = the (left, right) that signal's packed range
+    # evaluates to, so bit-shrink can narrow parameterized ranges
+    # (`logic [WIDTH-1:0] x;`). Empty => those stay uncut.
+    symbolic_ranges: dict[str, dict[str, tuple[int, int]]] = {}
+    elab_blob_path = None
 
-    def is_excluded(module_name: str) -> bool:
+    if args.in_situ:
+        # MARK: In-situ front end -- no elaboration, no rewriting.
+        # The original parameterized definitions ARE the canonical source, so
+        # orig_dir doubles as the cut spec lib. A definition is shared by all its
+        # instances, so a cut must hold for every one of them -- which the checks
+        # below enforce for free, since each elaborates at the design top.
+        conc_trees, ctree_dir = orig_trees, orig_dir
+        top_name = args.top
+        try:
+            comp = build_compilation_from(raw_trees)
+            symbolic_ranges = chipper.definition_signal_ranges(comp)
+            tops = [t.name for t in comp.getRoot().topInstances]
+        except Exception as e:
+            if top_name is None:
+                raise SystemExit(
+                    f"FATAL: could not elaborate to discover the top module ({e}). "
+                    f"Pass --top NAME to cut without elaborating at all."
+                )
+            status(f"WARNING: read-only elaboration failed ({e}); bit-shrink cuts "
+                   f"on parameterized ranges will be skipped.")
+        else:
+            if top_name is None:
+                if len(tops) != 1:
+                    raise SystemExit(
+                        f"FATAL: expected exactly one top-level instance, got "
+                        f"{tops or 'none'}. Pass --top NAME to choose one."
+                    )
+                top_name = tops[0]
+        if top_name not in defined_in:
+            raise SystemExit(f"FATAL: top module '{top_name}' is not among the inputs.")
+        # No renaming happens in situ, so a module can be left uncut on its own
+        # without dragging its subtree along (unlike the elaborated path below).
+        verbatim = {
+            n for _, n in conc_trees
+            if any(fnmatch.fnmatch(n, p) for p in exclude_patterns)
+        }
+        status(f"In-situ top: {top_name} ({len(conc_trees)} module definitions, "
+               f"not elaborated)")
+    else:
+        # MARK: Elaboration -- the canonical front end.
+        # Unroll generates, resolve parameters, and flatten hierarchy up front by
+        # re-emitting the whole design from a live slang elaboration. Excluded
+        # modules are emitted verbatim (opaque boundaries) so they reach the formal
+        # tool as their original source and parents instantiate them by their
+        # original name. Everything downstream (the FV gate and the cut pipeline)
+        # treats the elaborated source as canonical -- chipper.eval_modules
+        # concretization is no longer part of the flow.
+        status("Elaborating design (unroll + flatten + concretize)...")
+        try:
+            elab = elaborate_design(args.input_files, flatten=True, ignore=exclude_patterns,
+                                    fold_constants=args.fold_constants,
+                                    incdirs=incdirs, defines=defines)
+        except (ElaborationError, EmitError) as e:
+            raise SystemExit(f"FATAL: elaboration failed: {e}")
+
+        if len(elab.tops) != 1:
+            raise SystemExit(
+                f"FATAL: expected exactly one top-level instance, got {elab.tops or 'none'}."
+            )
+        top_name = elab.top
+        status(f"Elaborated top: {top_name}")
+
+        # The elaborated whole-design source is a single self-contained blob (all
+        # specialized submodules + verbatim boundaries in one file). Keep it in its
+        # own dir so it never pollutes the original-source library used by the gate.
+        elab_dir = f"{output_dir}/elab"
+        os.makedirs(elab_dir, exist_ok=True)
+        elab_blob_path = f"{elab_dir}/{top_name}_elaborated.sv"
+        with open(elab_blob_path, "w") as f:
+            f.write(elab.source)
+
+        # Canonical per-module sources = the elaborated blob, split one module per
+        # file. This replaces the old concretized-tree list and becomes the cut spec
+        # lib. split_tree yields (name, tree); the pipeline consumes (tree, name).
+        blob_tree = SyntaxTree.fromText(elab.source)
+        conc_trees = [(tree, name) for name, tree in chipper.split_tree(blob_tree)]
+
         # The elaborator emits an excluded module AND its whole subtree verbatim
         # (an opaque boundary), so the uncut set is exactly what it emitted
-        # verbatim -- not just the pattern-matched names. Skip cutting all of it.
-        return module_name in elab.verbatim
+        # verbatim -- not just the pattern-matched names.
+        verbatim = elab.verbatim
+
+        ctree_dir = f"{output_dir}/concrete_sources"
+        os.makedirs(ctree_dir, exist_ok=True)
+        for tree, name in conc_trees:
+            with open(f"{ctree_dir}/{name}.sv", "w") as f:
+                f.write(print_tree(tree))
+
+        status("Elaboration complete.")
+
+    def is_excluded(module_name: str) -> bool:
+        return module_name in verbatim
 
     def is_cut_target(module_name: str) -> bool:
         # --cut-only: when set, enumerate cuts only on modules whose name matches
-        # one of the fnmatch globs. Non-matching modules stay elaborated and in
-        # the golden source (real context) but are never cut. Empty => cut all.
+        # one of the fnmatch globs. Non-matching modules stay in the golden source
+        # (real context) but are never cut. Empty => cut all.
         if not cut_only_patterns:
             return True
         return any(fnmatch.fnmatch(module_name, p) for p in cut_only_patterns)
-
-    ctree_dir = f"{output_dir}/concrete_sources"
-    os.makedirs(ctree_dir, exist_ok=True)
-
-    # Write the canonical (elaborated) per-module trees; this is the spec lib.
-    for tree, name in conc_trees:
-        with open(f"{ctree_dir}/{name}.sv", "w") as f:
-            f.write(print_tree(tree))
-
-    status("Elaboration complete.")
 
     # Make a directory for the final output sources
     consolidated_dir = f"{output_dir}/consolidated_sources"
@@ -588,8 +676,10 @@ async def main():
     # Both sides elaborate at the design top; the blob is self-contained so the
     # -y orig_dir search path is harmless. A non-proven verdict is fatal -- every
     # downstream cut is checked against the elaborated golden, so an unfaithful
-    # elaboration would silently invalidate the entire run.
-    if backend is not None:
+    # elaboration would silently invalidate the entire run. Vacuous under
+    # --in-situ, where the canonical source IS the original (the self-check above
+    # already covers that comparison), so it is skipped there.
+    if backend is not None and elab_blob_path is not None:
         status("FV gate: verifying elaborated design == original...")
         gate_dir = f"{elab_dir}/fv"
         os.makedirs(gate_dir, exist_ok=True)
@@ -626,10 +716,14 @@ async def main():
             )
         fv_gate_result = (getattr(gate_run, "verdict", None) or "proven").upper()
         status("FV gate passed: elaborated design == original.")
+    elif args.in_situ:
+        fv_gate_result = "N/A (in-situ)"
     else:
         status("FV gate skipped (no -e/backend); elaborated source is unverified.")
 
     if args.mux_rewrites:
+        # Bit muxes are sized from the same literal packed ranges bit-shrink uses,
+        # so under --in-situ they are only inserted for non-parameterized signals.
         status("Performing mux rewrites...")
         mux_dir = f"{output_dir}/muxed_sources"
         os.makedirs(mux_dir, exist_ok=True)
@@ -688,6 +782,7 @@ async def main():
             ntree,
             shrink_with_intermediate=args.shrink_with_intermediate,
             binops_in_conditions_only=args.binops_in_conditions_only,
+            symbolic_ranges=symbolic_ranges.get(name, {}),
         )
         cut_infos = list(pc.cut_info())  # (type, line) aligned 1:1 with cut indices
 
