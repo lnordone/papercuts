@@ -1,5 +1,5 @@
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Union
 from pyslang.syntax import SyntaxNode, SyntaxRewriter, SyntaxTree, SyntaxPrinter
 from pyslang.parsing import Token
@@ -70,3 +70,8 @@ class Run:
     #: dimension. 1 for a plain single-bit shrink; higher when --iterative-bitshrink
     #: greedily removes several bits. Meaningless (stays 1) for non-bitshrink cuts.
     shrink_amount: int = 1
+    #: Module definition names to black-box during EC, from scope reduction:
+    #: everything provably outside this cut's cone of influence. Empty means no
+    #: reduction -- the historical whole-design check. Applied to *both* SEC
+    #: compile contexts, so the two sides stay comparable.
+    bbox_modules: list = field(default_factory=list)

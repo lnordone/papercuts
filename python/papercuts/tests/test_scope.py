@@ -11,7 +11,7 @@ cone is missing.
 import os
 import tempfile
 
-from papercuts.scope import build_graph
+from papercuts.scope import blackboxable_definitions, build_graph
 
 # Two independent paths through the design: u_a feeds `y`, u_b feeds `z`.
 # Nothing crosses between them, so each submodule's cone is exactly half.
@@ -76,13 +76,83 @@ endmodule
 """
 
 
-def _graph(src, name):
+# `missing_ram` has no definition anywhere in the compilation. With
+# allow_missing=True it elaborates to an UninstantiatedDefSymbol, whose ports
+# were never resolved -- so every connected signal must be treated as both
+# driving and driven, keeping `d -> q` reachable.
+OPAQUE = """
+module top (input logic clk, input logic d, output logic q);
+    logic w;
+    missing_ram u_ram (.clk(clk), .in(d), .out(w));
+    assign q = w;
+endmodule
+"""
+
+
+# Two more shapes that carry dataflow without a ContinuousAssign member:
+# `wire w = ...` stores its driver as the net's own initializer, and a gate
+# primitive has no body to walk. Both must still connect a -> y and a -> z.
+IMPLICIT = """
+module top (input logic a, input logic b, output logic y, output logic z);
+    wire w = a & b;
+    assign y = w;
+    and g1 (z, a, b);
+endmodule
+"""
+
+
+# `orphan` is instantiated by nothing, so slang makes it a second root. Its
+# ports must not count as design I/O of `top`, and its children must not appear
+# as blackboxable for a proof of `top`.
+MULTIROOT = """
+module leaf (input logic i, output logic o);
+    assign o = ~i;
+endmodule
+
+module top (input logic a, output logic y);
+    leaf u_leaf (.i(a), .o(y));
+endmodule
+
+module orphan (input logic oa, output logic oy);
+    leaf u_orphan_leaf (.i(oa), .o(oy));
+endmodule
+"""
+
+
+# `buf` is instantiated twice: u_hot is downstream of the target u_t, u_cold is
+# unrelated. Blackboxing the *definition* `buf` would take both out, abstracting
+# away logic the cut can reach -- so the name must not be offered even though
+# u_cold on its own is a fine instance-level blackbox candidate.
+SHARED_DEF = """
+module buf_ (input logic i, output logic o);
+    assign o = i;
+endmodule
+
+module target (input logic i, output logic o);
+    assign o = ~i;
+endmodule
+
+module top (
+    input  logic a,
+    input  logic b,
+    output logic y,
+    output logic z
+    );
+    logic w;
+    target u_t   (.i(a), .o(w));
+    buf_   u_hot (.i(w), .o(y));
+    buf_   u_cold(.i(b), .o(z));
+endmodule
+"""
+
+
+def _graph(src, name, **kw):
     """Build a ScopeGraph from inline source via a temp .sv file."""
     d = tempfile.mkdtemp(prefix="pc_scope_")
     path = os.path.join(d, f"{name}.sv")
     with open(path, "w") as f:
         f.write(src)
-    return build_graph([path])
+    return build_graph([path], **kw)
 
 
 def _names(ports):
@@ -141,6 +211,78 @@ def test_control_dependence_and_lvalue_split():
     )
 
 
+def test_opaque_instance_connects_all_ports():
+    """A module with no definition must still carry dataflow.
+
+    Regression: ``UninstantiatedDefSymbol.getPortConnections()`` returns bare
+    ``Expression``s (InstanceSymbols.h:338) while ``InstanceSymbol`` returns
+    ``PortConnection`` wrappers (:118). Unwrapping the latter shape blindly made
+    every connection resolve to ``None``, so unknown-module instances
+    contributed no edges at all -- a silently *under*-approximated cone, which
+    is the direction that yields false "proven" verdicts.
+    """
+    g = _graph(OPAQUE, "opaque", allow_missing=True)
+
+    assert g.opaque, "the undefined instance was not recorded as opaque"
+
+    d = next(p for p in g.ports["top"] if p.name == "d")
+    q = next(p for p in g.ports["top"] if p.name == "q")
+    # d reaches q only by passing through the undefined `missing_ram`.
+    assert q.node in g.reachable([d.node]), (
+        "no dataflow through the undefined module; its port connections were "
+        "dropped"
+    )
+    assert d.node in g.reachable([q.node], forward=False)
+
+
+def test_net_initializer_and_primitive():
+    """Drivers that are not ContinuousAssign members still produce edges."""
+    g = _graph(IMPLICIT, "implicit")
+
+    a = next(p for p in g.ports["top"] if p.name == "a")
+    y = next(p for p in g.ports["top"] if p.name == "y")
+    z = next(p for p in g.ports["top"] if p.name == "z")
+    forward = g.reachable([a.node])
+
+    assert y.node in forward, "`wire w = a & b` initializer produced no edges"
+    assert z.node in forward, "gate primitive `and g1` produced no edges"
+
+
+def test_top_restriction():
+    """--top confines the design to one root; other roots must not leak in."""
+    both = _graph(MULTIROOT, "multiroot")
+    assert sorted(both.tops) == ["orphan", "top"], both.tops
+    # Without --top, the orphan's instances are offered as blackboxable and its
+    # ports count as design I/O -- both meaningless for a proof of `top`.
+    assert "orphan.u_orphan_leaf" in both.cone("top.u_leaf").blackboxable
+
+    only = _graph(MULTIROOT, "multiroot", tops=["top"])
+    assert only.tops == ["top"], only.tops
+    cone = only.cone("top.u_leaf")
+    assert _names(cone.affecting_inputs) == ["a"], _names(cone.affecting_inputs)
+    assert _names(cone.affected_outputs) == ["y"], _names(cone.affected_outputs)
+    assert cone.blackboxable == [], cone.blackboxable
+    assert not any(p.startswith("orphan") for p in only.ports), sorted(only.ports)
+
+
+def test_blackboxable_definitions():
+    """A definition name is only safe when *all* its instances are out of cone."""
+    g = _graph(SHARED_DEF, "shared_def")
+    cone = g.cone("top.u_t")
+
+    # Instance-level, u_cold is correctly blackboxable and u_hot is not.
+    assert "top.u_cold" in cone.blackboxable, cone.blackboxable
+    assert "top.u_hot" not in cone.blackboxable, cone.blackboxable
+
+    # But both are instances of `buf_`, so the *name* must not be offered --
+    # -bbox_module buf_ would also abstract away u_hot, which carries the cut's
+    # effect to `y`, making both sides agree trivially.
+    names = blackboxable_definitions(g, cone)
+    assert "buf_" not in names, names
+    assert "target" not in names, names
+    assert "top" not in names, names
+
+
 def test_no_unhandled_kinds():
     """The conservative fallback should not fire on ordinary RTL."""
     for src, name in ((SPLIT, "split"), (CHAIN, "chain"), (CONTROL, "control")):
@@ -152,6 +294,10 @@ def run():
     test_split_cones()
     test_chain_cones()
     test_control_dependence_and_lvalue_split()
+    test_opaque_instance_connects_all_ports()
+    test_net_initializer_and_primitive()
+    test_top_restriction()
+    test_blackboxable_definitions()
     test_no_unhandled_kinds()
     print("scope: OK")
 

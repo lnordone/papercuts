@@ -19,6 +19,7 @@ import papercuts.chipper as chipper
 from papercuts.elaborator import elaborate_design, ElaborationError, EmitError
 from papercuts.utils import print_tree, status, set_verbose, Run
 from papercuts.ec import generate_jasper_tcl_script
+from papercuts.scope import blackboxable_definitions, build_graph
 from papercuts.backends import discover_backends, get_backend
 from papercuts.pypercuts import Papercutter, insert_muxes
 from papercuts.status import StatusWriter
@@ -40,6 +41,30 @@ class ModuleCuts:
     runs: list[Run] = field(default_factory=list)
     excluded: bool = False     # kept in the golden source but never cut
     noops: list[int] = field(default_factory=list)  # cut indices identical to source (never FVed)
+    #: Scope reduction: module definition names outside this module's cone of
+    #: influence, so safe to black-box for every cut in it. Empty = no reduction.
+    bbox_modules: list[str] = field(default_factory=list)
+
+
+def _module_bbox(graph, module_name: str) -> list[str]:
+    """Definition names safe to black-box for any cut in ``module_name``.
+
+    The cone belongs to the module's *instance*, so it is computed once here and
+    shared by every cut in it -- a cut can only reach what its enclosing
+    instance can reach, whatever the cut is.
+
+    Returns an empty list (no reduction, full-design check) whenever the module
+    cannot be resolved to exactly one instance. That happens for modules the
+    elaborator emitted verbatim, which keep one shared definition name across
+    every instance; those are excluded from cutting anyway, but bailing out here
+    keeps the rule local instead of relying on that.
+    """
+    if graph is None:
+        return []
+    paths = [p for p, d in graph.definition.items() if d == module_name]
+    if len(paths) != 1:
+        return []
+    return blackboxable_definitions(graph, graph.cone(paths[0]))
 
 
 # MARK: results stream
@@ -344,6 +369,16 @@ async def main():
         "box -- check the reported black-box list.",
     )
     parser.add_argument(
+        "--scope-reduce",
+        action="store_true",
+        help="During equivalence checking, black-box every module provably "
+        "outside the cut's cone of influence (see papercuts.scope). A cut can "
+        "only change outputs in its forward cone, so out-of-cone logic is "
+        "identical on both sides and abstracting it away is sound. Cuts "
+        "rejected under reduction are automatically re-checked against the "
+        "full design, so a black-boxing artifact can never discard a valid cut.",
+    )
+    parser.add_argument(
         "--fold-constants",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -479,6 +514,29 @@ async def main():
     for tree, name in conc_trees:
         with open(f"{ctree_dir}/{name}.sv", "w") as f:
             f.write(print_tree(tree))
+
+    # Scope reduction: one dataflow graph over the canonical per-module sources
+    # -- the exact file set Jasper analyzes via -y, so the cones describe the
+    # netlist being checked. The elaborator emits one uniquely named module per
+    # instance, so a definition name here identifies a single instance and
+    # `elaborate -bbox_m` is exact. (-bbox_m also accepts wildcards; the
+    # elaborator's mangled names are alphanumeric-and-underscore only, so they
+    # can never be read as a pattern.)
+    scope_graph = None
+    if args.scope_reduce and backend is not None:
+        status("Building cone-of-influence graph for scope reduction...")
+        try:
+            scope_graph = build_graph(
+                [f"{ctree_dir}/{n}.sv" for _, n in conc_trees],
+                tops=[top_name],
+                allow_missing=args.allow_missing_modules,
+            )
+        except (ElaborationError, EmitError) as e:
+            # Degrade to full-design checks rather than kill the run: this
+            # source already passed elaboration above, so a failure here is a
+            # scope.py problem and must not cost the user their whole run.
+            status(f"WARNING: scope reduction disabled ({e})")
+            scope_graph = None
 
     status("Elaboration complete.")
 
@@ -657,6 +715,7 @@ async def main():
             cur_dir=cur_dir,
             shrink_widths=list(pc.cut_shrink_widths()),  # per-index dim width (0 if not bitshrink)
             baseline=print_tree(ntree),
+            bbox_modules=_module_bbox(scope_graph, name),
         )
         for idx in range(len(cut_infos)):
             run = Run(
@@ -666,6 +725,9 @@ async def main():
                 impl_module_folder=cur_dir,
                 is_top=is_top,
                 index=idx,
+                # Copy: the cex re-check below swaps this list out per run, and
+                # these runs execute concurrently.
+                bbox_modules=list(mod.bbox_modules),
             )
             mod.runs.append(run)
             all_runs.append(run)
@@ -787,8 +849,22 @@ async def main():
 
             tracker.start(id(run))
             t0 = time.time()
+            reduced_verdict = None
             try:
                 await backend.check(run)
+
+                # Scope reduction can manufacture a false cex -- if SEC frees the
+                # two contexts' black-box outputs independently, the sides differ
+                # for reasons that have nothing to do with the cut. It cannot
+                # manufacture a false "proven" (only a wrong cone could, which is
+                # a scope.py bug). So re-verify rejections against the full
+                # design rather than discard a possibly-valid cut on an artifact.
+                if run.bbox_modules and run.verdict == "cex":
+                    reduced_verdict = run.verdict
+                    saved, run.bbox_modules = run.bbox_modules, []
+                    await backend.check(run)
+                    run.bbox_modules = saved
+
                 # Iterative bit-shrink: once one bit is proven removable, greedily
                 # remove more from the same dimension (2, 3, ...) until a check
                 # fails, keeping the last passing width. Each probe re-verifies the
@@ -830,6 +906,14 @@ async def main():
                     "valid": run.valid, "verdict": getattr(run, "verdict", None),
                     "shrink_amount": run.shrink_amount,
                     "elapsed": round(time.time() - t0, 3),
+                    # Scope reduction: how many modules were abstracted away, out
+                    # of how many instances exist. verdict_reduced is set only
+                    # when a reduced cex was re-checked against the full design;
+                    # it disagreeing with `verdict` means black-boxing changed
+                    # the answer, which is the signal to investigate.
+                    "bbox": len(run.bbox_modules),
+                    "instances": len(scope_graph.ports) if scope_graph else None,
+                    "verdict_reduced": reduced_verdict,
                 })
             done += 1
             verdict = "PROVEN" if run.valid else "failed"
@@ -909,6 +993,7 @@ async def main():
                     impl_module_folder=work_dir,
                     is_top=mod.is_top,
                     index=-1,
+                    bbox_modules=mod.bbox_modules,
                 ),
             )
         )
@@ -937,6 +1022,7 @@ async def main():
                     "verdict": getattr(final_run, "verdict", None),
                     "applied": sum(1 for r in mod.runs if r.valid),
                     "elapsed": round(time.time() - t0, 3),
+                    "bbox": len(final_run.bbox_modules),
                 })
 
     status(f"Verifying {len(final_runs)} consolidated module(s)...")

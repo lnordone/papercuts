@@ -29,6 +29,15 @@ cone *larger*. That direction is safe -- an over-large cone blackboxes fewer
 modules and loses performance, while an under-large cone would blackbox logic
 that actually carries the cut's effect and silently produce a false "proven".
 Run with ``--dump`` to see which kinds hit the fallback.
+
+The same asymmetry governs ``--ignore-diag``. Slang refuses to hand back an
+elaboration it considers erroneous, and real RTL trips errors that have no
+bearing on dataflow -- ``MissingTimeScale`` is pure timing metadata, for
+instance. Suppressing those is safe. Suppressing an error that means part of the
+design failed to elaborate is not: the missing logic yields a cone that is too
+*small*, which is the direction that produces false "proven" verdicts. Prefer
+``--allow-missing-modules`` for absent definitions, since that routes them
+through the conservative opaque-instance path instead of dropping them.
 """
 
 from __future__ import annotations
@@ -38,11 +47,53 @@ import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
+import pyslang
+
 from papercuts.elaborator import (
     ElaborationError,
     build_compilation,
-    report_diagnostics,
 )
+
+#: Member kinds that carry no dataflow of their own: declarations, imports and
+#: type machinery. Any driver they have appears as a separate ContinuousAssign
+#: or ProceduralBlock member, or as an initializer handled explicitly. Listed
+#: exhaustively so that genuinely unrecognized kinds stay visible in --dump
+#: instead of being dropped in silence. Deliberately excluded, because they do
+#: move data and should surface as unhandled until handled: NetAlias, Modport,
+#: CheckerInstance.
+INERT_MEMBER_KINDS = {
+    "Attribute", "AssertionPort", "ClockingBlock", "ClockVar",
+    "CompilationUnit", "ConstraintBlock", "DefParam", "Definition",
+    "ElabSystemTask", "EmptyMember", "EnumValue", "ExplicitImport",
+    "ForwardingTypedef", "GenericClassDef", "Genvar", "InstanceBody",
+    "InterfacePort", "LetDecl", "MethodPrototype", "MultiPort", "Package",
+    "Parameter", "Port", "Primitive", "PrimitivePort", "Property", "Sequence",
+    "SpecifyBlock", "Specparam", "StatementBlock", "Subroutine", "TypeAlias",
+    "TypeParameter", "TransparentMember", "WildcardImport",
+}
+
+
+def _conn_expr(conn):
+    """Normalize one port connection down to an ``Expression``.
+
+    The shape depends on which symbol owns the connection
+    (``slang/ast/symbols/InstanceSymbols.h``)::
+
+        InstanceSymbol          :118  PortConnection -- expression in .expression
+        UninstantiatedDefSymbol :283  AssertionExpr
+        PrimitiveInstanceSymbol :338  bare Expression
+
+    The middle case is the surprising one: slang cannot know that an unknown
+    definition is not a checker, so it binds the connections as assertion
+    expressions and the real ``Expression`` sits inside ``SimpleAssertionExpr``
+    (``ASTBindings.cpp:400``). ``AssertionExpr`` has no ``.visit``, so failing
+    to unwrap it either raises or yields no refs at all.
+    """
+    ex = getattr(conn, "expression", conn)
+    if ex is not None and kind(ex) == "Simple":
+        ex = getattr(ex, "expr", None)
+    return ex
+
 
 #: Symbol kinds that carry a runtime value and therefore become graph nodes.
 #: Parameters, genvars and specparams are resolved constants in an elaborated
@@ -150,21 +201,42 @@ class ScopeGraph:
         self.opaque: set[str] = set()
         #: unhandled AST kinds that hit the conservative fallback, with counts
         self.unhandled: dict[str, int] = defaultdict(int)
+        #: owning Compilation, set by build_graph. pyslang symbols are
+        #: non-owning references into its arena, so it must outlive the graph.
+        self._comp = None
 
     # --- construction --------------------------------------------------------
 
     @classmethod
-    def build(cls, comp, opaque_defs=()) -> "ScopeGraph":
+    def build(cls, comp, opaque_defs=(), tops=()) -> "ScopeGraph":
         """Build the graph for every top instance in ``comp``.
 
         ``opaque_defs`` names module *definitions* whose bodies must not be
         walked (vendor IP, ``--exclude-module`` targets). Each such instance is
         wired input-to-output all-to-all, matching how the emitter treats a
         module it cannot see inside.
+
+        ``tops`` restricts the roots by module name. Slang makes every module
+        that nothing instantiates a top, so a source directory holding unused
+        or leftover modules yields several roots -- and then their ports count
+        as design I/O and their instances appear as blackboxable, which is
+        meaningless for a proof of one specific top. Empty means "all roots".
         """
         g = cls()
         opaque = set(opaque_defs)
-        for inst in comp.getRoot().topInstances:
+        roots = list(comp.getRoot().topInstances)
+        wanted = set(tops)
+        if wanted:
+            roots = [i for i in roots if i.name in wanted]
+            missing = wanted - {i.name for i in roots}
+            if missing:
+                found = ", ".join(sorted(i.name for i in comp.getRoot().topInstances))
+                raise ElaborationError(
+                    f"top module(s) {sorted(missing)} are not roots of this "
+                    f"compilation. Roots found: {found or '(none)'}. A module "
+                    f"that something else instantiates is not a root."
+                )
+        for inst in roots:
             g.tops.append(inst.hierarchicalPath)
             g._add_instance(inst, opaque)
         return g
@@ -224,15 +296,32 @@ class ScopeGraph:
             elif k == "Instance":
                 self._connect(m)
                 self._add_instance(m, opaque_defs)
-            elif k == "UninstantiatedDef":
+            elif k in ("UninstantiatedDef", "PrimitiveInstance"):
+                # No body to walk: an unknown definition, or a gate primitive.
                 self._connect_opaque(m)
-            elif k in ("GenerateBlock", "GenerateBlockArray"):
-                # A generate block is a scope in its own right; its members are
-                # ordinary module members. Uninstantiated branches carry no
-                # logic in the elaborated design.
+            elif k in ("Net", "Variable"):
+                # `wire w = a & b;` keeps its driver as the symbol's own
+                # initializer instead of emitting a separate ContinuousAssign
+                # member -- which is why elaborator._emit_member reads the
+                # initializer off the net too. Missing this drops real edges.
+                init = getattr(m, "initializer", None)
+                if init is not None:
+                    reads: set[str] = set()
+                    self._refs(init, reads)
+                    self.add_edges(reads, {canon(m)})
+            elif k in ("GenerateBlock", "GenerateBlockArray", "InstanceArray"):
+                # Each is a Scope whose members are ordinary module members
+                # (for InstanceArray, the per-element Instances of `u[3:0]`).
+                # Uninstantiated generate branches carry no elaborated logic.
                 if getattr(m, "isUninstantiated", False):
                     continue
                 self._walk_members(m, opaque_defs)
+            elif k not in INERT_MEMBER_KINDS:
+                # Anything unrecognized is recorded rather than dropped. A
+                # missed member is a *missing* edge, which shrinks cones -- the
+                # direction that produces false "proven" verdicts -- so it must
+                # stay visible in --dump rather than failing silently.
+                self.unhandled[f"member:{k}"] += 1
 
     def _connect(self, inst) -> None:
         """Edges across an instance boundary, from its port connections."""
@@ -272,7 +361,7 @@ class ScopeGraph:
         self.opaque.add(u.hierarchicalPath)
         refs: set[str] = set()
         for conn in getattr(u, "portConnections", ()) or ():
-            ex = getattr(conn, "expression", None)
+            ex = _conn_expr(conn)
             if ex is not None:
                 self._refs(ex, refs)
         self.add_edges(refs, refs)
@@ -520,16 +609,83 @@ class ScopeGraph:
 
 
 # MARK: entry points
-def build_graph(files, *, opaque_defs=(), allow_missing=False) -> ScopeGraph:
+def resolve_diag_codes(names):
+    """Map slang diagnostic names (``"MissingTimeScale"``) to ``DiagCode``s."""
+    codes = set()
+    for name in names:
+        code = getattr(pyslang.Diags, name, None)
+        if code is None:
+            raise ElaborationError(
+                f"unknown diagnostic name {name!r}. Names are slang's, as they "
+                f"appear in its diagnostics table -- e.g. MissingTimeScale, "
+                f"UsedBeforeDeclared, UnknownModule."
+            )
+        codes.add(code)
+    return codes
+
+
+def report_diagnostics(comp, ignored=()):
+    """Print diagnostics; return True if any *non-ignored* error remains.
+
+    This is ``elaborator.report_diagnostics`` plus a filter. It cannot be
+    implemented by remapping severities on the engine: ``Diagnostic.isError()``
+    is derived from the code's *default* severity in slang
+    (``Diagnostics.cpp:38``) and ignores engine mappings entirely, so a
+    suppressed code has to be dropped before the check rather than downgraded.
+    """
+    ignored = set(ignored)
+    client = pyslang.TextDiagnosticClient()
+    engine = pyslang.DiagnosticEngine(comp.sourceManager)
+    engine.addClient(client)
+    errored = False
+    for d in comp.getAllDiagnostics():
+        if d.code in ignored:
+            continue
+        engine.issue(d)
+        errored = errored or d.isError()
+    text = client.getString()
+    if text.strip():
+        print(text, file=sys.stderr)
+    return errored
+
+
+def build_graph(
+    files, *, opaque_defs=(), allow_missing=False, ignore_diags=(), tops=()
+) -> ScopeGraph:
     """Elaborate ``files`` and build the dataflow graph for the whole design."""
     comp = build_compilation(list(files), allow_missing=allow_missing)
-    if report_diagnostics(comp):
+    if report_diagnostics(comp, resolve_diag_codes(ignore_diags)):
         raise ElaborationError("input has compilation errors; aborting")
-    graph = ScopeGraph.build(comp, opaque_defs=opaque_defs)
+    graph = ScopeGraph.build(comp, opaque_defs=opaque_defs, tops=tops)
     # Hold the compilation alive: pyslang symbols are non-owning references into
     # its arena, and the graph is derived from them.
     graph._comp = comp
     return graph
+
+
+def blackboxable_definitions(graph: ScopeGraph, cone: Cone) -> list[str]:
+    """Module *definition* names safe to hand to ``elaborate -bbox_m``.
+
+    ``Cone.blackboxable`` names instances, but Jasper's ``-bbox_m`` takes a
+    module name and abstracts away *every* instance of it. Those coincide
+    for a design elaborated with ``flatten=True``, which emits one uniquely
+    named definition per instance -- but not for modules the elaborator emitted
+    verbatim (``--exclude-module`` and its subtree), which keep their original
+    name and are shared by all their instances.
+
+    So a name is returned only when every instance carrying it is blackboxable.
+    Blackboxing a name with even one in-cone instance would abstract away logic
+    the cut can reach; both sides of the equivalence check would then agree
+    trivially and report a false "proven".
+    """
+    instances_by_def: dict[str, set[str]] = defaultdict(set)
+    for path, def_name in graph.definition.items():
+        instances_by_def[def_name].add(path)
+
+    safe = set(cone.blackboxable)
+    return sorted(
+        name for name, paths in instances_by_def.items() if paths <= safe
+    )
 
 
 def main() -> int:
@@ -551,8 +707,20 @@ def main() -> int:
              "outputs). Repeatable.",
     )
     parser.add_argument(
+        "--top", action="append", default=[], metavar="MODULE",
+        help="restrict the design to this top module. Repeatable. Without it "
+             "every module nothing instantiates becomes a root, and unrelated "
+             "roots' ports count as design I/O.",
+    )
+    parser.add_argument(
         "--allow-missing-modules", action="store_true",
         help="treat instantiations of undefined modules as black boxes",
+    )
+    parser.add_argument(
+        "--ignore-diag", action="append", default=[], metavar="NAME",
+        help="slang diagnostic to suppress, by name (e.g. MissingTimeScale). "
+             "Repeatable. Only suppress diagnostics that cannot affect "
+             "dataflow -- see the module docstring.",
     )
     parser.add_argument(
         "--dump", action="store_true",
@@ -565,6 +733,8 @@ def main() -> int:
             args.files,
             opaque_defs=args.exclude_module,
             allow_missing=args.allow_missing_modules,
+            ignore_diags=args.ignore_diag,
+            tops=args.top,
         )
     except ElaborationError as e:
         print(f"Error: {e}", file=sys.stderr)

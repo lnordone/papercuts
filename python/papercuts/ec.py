@@ -264,9 +264,23 @@ def generate_jasper_tcl_script_old(wrapper_name: str) -> str:
 def generate_jasper_tcl_script() -> str:
     tcl_script = "# TCL script for formal verification of wrapper module\n"
     tcl_script += """\n
-#Arguments are : (5) top_module_path, (6) spec_lib_path, (7) imp_module_path, (8) is_top
+#Arguments are : (5) top_module_path, (6) spec_lib_path, (7) imp_module_path, (8) is_top,
+#                (9) bbox_modules
 
 set is_top [lindex $argv 8]
+
+# Scope reduction: modules provably outside the cut's cone of influence, passed
+# as one comma-joined token so csh word-splitting cannot break the list apart.
+# "-" means none. The resulting flags MUST go to both compile contexts below --
+# black-boxing only one side would compare a reduced design against a full one
+# and report a spurious cex.
+set bbox_args ""
+set bbox_raw [lindex $argv 9]
+if {$bbox_raw ne "" && $bbox_raw ne "-"} {
+    foreach m [split $bbox_raw ","] {
+        append bbox_args " -bbox_m $m"
+    }
+}
 
 if {[catch {
 
@@ -276,11 +290,11 @@ if {[catch {
     } else {
         analyze -sv -v [lindex $argv 7] -y [lindex $argv 6] [lindex $argv 5] +libext+.sv
     }
-    elaborate -bbox_mul 64 -bbox_div 64 -bbox_mod 64
+    eval elaborate -bbox_mul 64 -bbox_div 64 -bbox_mod 64 $bbox_args
     # Analyze and elaborate the implementation design
     check_sec -compile_context imp
     analyze -sv -y [lindex $argv 6] [lindex $argv 5] +libext+.sv
-    elaborate -bbox_mul 64 -bbox_div 64 -bbox_mod 64
+    eval elaborate -bbox_mul 64 -bbox_div 64 -bbox_mod 64 $bbox_args
     # Setup verification environment
     check_sec -setup
     reset -none
@@ -336,11 +350,16 @@ def _parse_verdict(output: str, returncode: int) -> str:
 
 # MARK: Jasper Runner
 async def run_jasper(run: pc_core.Run, print_output: bool = False):
+    # Scope-reduction black-box list as a single comma-joined token; "-" when
+    # empty, because a trailing empty argument would be dropped by the shell and
+    # leave the TCL's [lindex $argv 9] unset.
+    bbox = ",".join(run.bbox_modules) or "-"
+
     # stdin=DEVNULL detaches jg from our controlling terminal; otherwise it puts
     # the inherited tty into raw mode (ONLCR off) and doesn't restore it, making
     # subsequent status prints "stairstep" across the screen.
     process = await asyncio.create_subprocess_shell(
-        f"csh -c 'jg -no_gui -proj {run.impl_module_folder}/jgproject{run.index} pcjg.tcl --- {run.top_module_path} {run.spec_lib_path} {run.impl_module_path} {run.is_top}'",
+        f"csh -c 'jg -no_gui -proj {run.impl_module_folder}/jgproject{run.index} pcjg.tcl --- {run.top_module_path} {run.spec_lib_path} {run.impl_module_path} {run.is_top} {bbox}'",
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
