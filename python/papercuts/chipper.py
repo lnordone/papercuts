@@ -298,6 +298,28 @@ def eval_modules(
     # DO REWRITES OVER DEFINITIONS FROM COMPILATION
 
 
+#: Include guard wrapped around the `$unit`-scope preamble that ``split_tree``
+#: replicates into every per-module file. Each split file must carry the preamble
+#: to parse standalone, but a formal tool analyzes the whole set into ONE global
+#: compilation unit (Jasper's `analyze -y` does), where N copies of the same
+#: declaration are N redefinition errors. The guard makes the copies collapse to
+#: one there -- exactly how the original RTL's `include header avoids the same
+#: collision -- while staying a no-op for single-file-compilation-unit tools like
+#: slang, which give each file its own scope and its own macro state.
+UNIT_SCOPE_GUARD = "PC_UNIT_SCOPE_DECLS"
+
+
+def _guarded(info_trees: list[str]) -> list[str]:
+    """Wrap the replicated `$unit` preamble in its include guard (no-op if empty)."""
+    if not info_trees:
+        return []
+    return (
+        [f"`ifndef {UNIT_SCOPE_GUARD}", f"`define {UNIT_SCOPE_GUARD}"]
+        + info_trees
+        + ["`endif"]
+    )
+
+
 def split_tree(tree: SyntaxTree) -> list[tuple[str, SyntaxTree]]:
 
     modules = []
@@ -318,7 +340,7 @@ def split_tree(tree: SyntaxTree) -> list[tuple[str, SyntaxTree]]:
 
     for module in raw_modules:
         modules.append(
-            (module[0], SyntaxTree.fromText("\n".join(info_trees + [module[1]])))
+            (module[0], SyntaxTree.fromText("\n".join(_guarded(info_trees) + [module[1]])))
         )
 
     return modules

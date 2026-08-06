@@ -191,9 +191,8 @@ class Emitter:
         # rather than inside a package. These are referenced by the specialized
         # modules (e.g. a struct type used as a parameter type), so they must be
         # emitted before the modules that use them, or the output won't compile.
-        for cu in getattr(root, "compilationUnits", ()):
-            if self._emit_compilation_unit(cu):
-                self.emit()
+        if self._emit_compilation_units(root):
+            self.emit()
 
         # One emission unit per instance -- no dedup by definition name. Two
         # instances of the same definition with different parameter values emit
@@ -307,22 +306,69 @@ class Emitter:
         self.level -= 1
         self.emit("endpackage")
 
-    def _emit_compilation_unit(self, cu):
-        # Emit `$unit`-scope members at top level (no package wrapper). Handles the
-        # same declaration kinds as a package body; other members (imports, etc.)
-        # are dropped because elaboration has already resolved every reference to
-        # the emitted declaration. Returns True if anything was emitted.
-        emitted = False
-        for m in cu:
-            k = kind(m)
-            if k == "TypeAlias":
-                self._emit_typedef(m)
-                emitted = True
-            elif k == "Parameter":
-                self.emit(self._parameter_decl(m) + ";")
-                emitted = True
-            # TransparentMember (enum values), Genvar, imports, etc.: skip.
-        return emitted
+    def _capture(self, fn, *args):
+        """Run an emit-producing call and take its lines back off ``self.lines``.
+
+        Lets a declaration be rendered through the normal emit path (so it picks
+        up indentation and every type-rendering quirk) without committing it to
+        the output yet."""
+        start = len(self.lines)
+        fn(*args)
+        captured = self.lines[start:]
+        del self.lines[start:]
+        return captured
+
+    def _emit_compilation_units(self, root):
+        # Emit `$unit`-scope members at top level (no package wrapper), MERGED
+        # across every compilation unit. Handles the same declaration kinds as a
+        # package body; other members (imports, etc.) are dropped because
+        # elaboration has already resolved every reference to the emitted
+        # declaration. Returns True if anything was emitted.
+        #
+        # slang builds one CompilationUnitSymbol per addSyntaxTree -- i.e. per
+        # input file -- so a header carrying `$unit`-scope decls that is
+        # `include`d by N files yields N identical copies. That is correct during
+        # elaboration (each CU is its own scope, matching `-sfcu` semantics), but
+        # the blob emitted here is ONE file, where the repeats are redefinition
+        # errors. Merge by name, keeping first-occurrence order.
+        #
+        # Order is safe: a decl can't reference a name its own CU declares later,
+        # so the first occurrence of a dependent decl is always preceded by what
+        # it depends on.
+        seen = {}    # name -> rendered lines
+        order = []   # names, first-occurrence order
+        for cu in getattr(root, "compilationUnits", ()):
+            for m in cu:
+                k = kind(m)
+                if k == "TypeAlias":
+                    rendered = self._capture(self._emit_typedef, m)
+                elif k == "Parameter":
+                    rendered = self._capture(
+                        lambda p: self.emit(self._parameter_decl(p) + ";"), m)
+                else:
+                    continue  # TransparentMember (enum values), Genvar, imports
+                name = m.name
+                if name in seen:
+                    # Same name, different text is NOT a duplicate to drop: two
+                    # CUs can legitimately render one name differently (different
+                    # `define state at include time, a differently-folded
+                    # parameter). Picking one silently would change the blob's
+                    # semantics relative to the original design, so refuse.
+                    if seen[name] != rendered:
+                        raise EmitError(
+                            f"conflicting `$unit`-scope declarations of {name!r} "
+                            f"across compilation units:\n"
+                            + "\n".join(seen[name])
+                            + "\nvs\n"
+                            + "\n".join(rendered)
+                        )
+                    continue
+                seen[name] = rendered
+                order.append(name)
+
+        for name in order:
+            self.lines.extend(seen[name])
+        return bool(order)
 
     # --- modules -------------------------------------------------------------
 
