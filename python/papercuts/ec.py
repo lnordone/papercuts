@@ -341,7 +341,14 @@ def _parse_verdict(output: str, returncode: int) -> str:
         return "proven" if returncode == 0 else "error"
     if raw == "proven":
         return "proven"
-    if raw in ("cex", "falsified", "disproven", "not_proven", "not-proven"):
+    # "determined" is Jasper's aggregate for "every property reached a definite
+    # status" -- which, since an all-proven run returns "proven" instead, means
+    # at least one comparison point has a counterexample: the designs differ.
+    # "cex_threshold_reached" is what -prove returns when it stops on -cex_limit.
+    # Both are real disproofs, not tool failures; before these were added they
+    # fell through to "error" and every rejected cut was misreported.
+    if raw in ("cex", "falsified", "disproven", "not_proven", "not-proven",
+               "determined", "cex_threshold_reached"):
         return "cex"
     if raw in ("inconclusive", "undetermined", "unknown"):
         return "inconclusive"

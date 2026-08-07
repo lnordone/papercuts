@@ -853,13 +853,15 @@ async def main():
             try:
                 await backend.check(run)
 
-                # Scope reduction can manufacture a false cex -- if SEC frees the
-                # two contexts' black-box outputs independently, the sides differ
-                # for reasons that have nothing to do with the cut. It cannot
-                # manufacture a false "proven" (only a wrong cone could, which is
-                # a scope.py bug). So re-verify rejections against the full
-                # design rather than discard a possibly-valid cut on an artifact.
-                if run.bbox_modules and run.verdict == "cex":
+                # Scope reduction can manufacture a false rejection: replacing
+                # logic with free variables can make the sides differ, or make a
+                # proof stop converging, for reasons unrelated to the cut. It
+                # cannot manufacture a false "proven" (only a wrong cone could,
+                # which would be a scope.py bug). So re-verify *any* rejection
+                # against the full design rather than discard a possibly-valid
+                # cut on an artifact. Keyed on `valid` rather than a verdict
+                # string so it holds for backends that never set one.
+                if run.bbox_modules and not run.valid:
                     reduced_verdict = run.verdict
                     saved, run.bbox_modules = run.bbox_modules, []
                     await backend.check(run)
