@@ -269,16 +269,18 @@ private:
     bool allowSigned;   // Signed decls are only shrinkable when narrowing in place (not with intermediate wires)
     bool allowNets;     // Net decls (wire/tri/...) are only shrinkable when narrowing in place
     bool allowMultiDim; // Multi-packed-dim vectors are only shrinkable when narrowing in place
-    // Signal name -> the (left, right) its packed range actually evaluates to, for
-    // ranges whose bounds are not literals (`[WIDTH-1:0]`). Such a dimension is
-    // only shrinkable when these are known: they give both its true width and,
-    // crucially, its direction. A reversed range is legal SV -- `[W-1:0]` with a
-    // placeholder `parameter W = 0` is `[-1:0]`, a 2-bit range whose *left* is the
-    // low end -- so subtracting from the symbolic bound would silently widen it.
-    std::unordered_map<std::string, std::pair<int, int>> symbolicRanges;
+    // Signal name -> the (left, right) each of its packed dimensions actually
+    // evaluates to, outermost dimension first, for ranges whose bounds are not
+    // literals (`[WIDTH-1:0]`). Such a dimension is only shrinkable when these are
+    // known: they give both its true width and, crucially, its direction. A
+    // reversed range is legal SV -- `[W-1:0]` with a placeholder `parameter W = 0`
+    // is `[-1:0]`, a 2-bit range whose *left* is the low end -- so subtracting from
+    // the symbolic bound would silently widen it. One entry per dimension lets a
+    // multi-packed-dim vector be shrunk on every dimension, not just literal ones.
+    std::unordered_map<std::string, std::vector<std::pair<int, int>>> symbolicRanges;
 public:
     BitShrinkCollector(bool allowSigned = false, bool allowNets = false, bool allowMultiDim = false,
-                       std::unordered_map<std::string, std::pair<int, int>> symbolicRanges = {})
+                       std::unordered_map<std::string, std::vector<std::pair<int, int>>> symbolicRanges = {})
         : allowSigned(allowSigned), allowNets(allowNets), allowMultiDim(allowMultiDim),
           symbolicRanges(std::move(symbolicRanges)) {}
     void handle(const DeclaratorSyntax&);
@@ -410,6 +412,16 @@ public:
     std::vector<std::pair<const BinaryExpressionSyntax*, bool>> getFoundNodes(const std::shared_ptr<SyntaxTree>);
 };
 
+// MARK: ForceConst
+class ConstForceCollector : public SyntaxVisitor<ConstForceCollector> {
+private:
+    std::vector<const DeclaratorSyntax*> foundNodes; // 1-bit scalar logic/reg/bit + nets
+
+public:
+    void handle(const DeclaratorSyntax&);
+    std::vector<const DeclaratorSyntax*> getFoundNodes(const std::shared_ptr<SyntaxTree>);
+};
+
 // MARK: Papercutter
 
 class Papercutter: public PapercutsRewriter<Papercutter> {
@@ -421,6 +433,7 @@ private:
     size_t IRCount = 0;
     size_t CRCount = 0;
     size_t BRCount = 0;
+    size_t CFRCount = 0;
 
     // Bit-shrink strategy. When false (default), a shrink narrows the declaration
     // in place (e.g. `logic [7:0] x;` -> `logic [6:0] x;`). When true, it keeps
@@ -457,6 +470,10 @@ private:
     std::vector<std::pair<const BinaryExpressionSyntax*, bool>> binopNodes; // (binary expr, keepLeft)
     std::unordered_map<const BinaryExpressionSyntax*, bool> binopNodesToChange;
 
+    // Const-force variables
+    std::vector<const DeclaratorSyntax*> constForceNodes;    // 1-bit scalars, one per signal
+    std::unordered_map<std::string, bool> constForceActive;  // active run: signal name -> polarity (true=1)
+
     void clearState() {
         nodesToShrink.clear();
         runMap.clear();
@@ -464,6 +481,7 @@ private:
         ifNodesToChange.clear();
         caseNodesToChange.clear();
         binopNodesToChange.clear();
+        constForceActive.clear();
     }
 
     // Populate the *NodesToChange maps for the given global cut indices.
@@ -473,13 +491,14 @@ private:
     void selectCuts(const std::vector<size_t>& indicesToCut,
                     const std::unordered_map<size_t, int>& amounts = {});
 public:
-    // `symbolicRanges` maps signal name -> the (left, right) its packed range
-    // evaluates to, enabling bit-shrink on declarations whose range is
-    // parameterized (`logic [WIDTH-1:0] x;`). Empty (the default) keeps such
+    // `symbolicRanges` maps signal name -> the (left, right) each of its packed
+    // dimensions evaluates to (outermost first), enabling bit-shrink on
+    // declarations whose range is parameterized (`logic [WIDTH-1:0] x;`), including
+    // every dimension of a multi-packed-dim vector. Empty (the default) keeps such
     // declarations uncut.
     Papercutter(const std::shared_ptr<SyntaxTree> tree, bool shrinkWithIntermediate = false,
                 bool binopsInConditionsOnly = false,
-                std::unordered_map<std::string, std::pair<int, int>> symbolicRanges = {});
+                std::unordered_map<std::string, std::vector<std::pair<int, int>>> symbolicRanges = {});
     std::vector<std::shared_ptr<SyntaxTree>> cutAll();
     // `amounts`: optional per-bitshrink-index override of the number of bits to
     // drop (default 1). Enables iterative multi-bit shrinking; other cut families
@@ -503,6 +522,7 @@ public:
     std::vector<std::shared_ptr<SyntaxTree>> removeAllIfs();
     std::vector<std::shared_ptr<SyntaxTree>> removeAllCases();
     std::vector<std::shared_ptr<SyntaxTree>> removeAllBinops();
+    std::vector<std::shared_ptr<SyntaxTree>> removeAllConstForces();
 
     void handle(const DataDeclarationSyntax& node);
     void handle(const NetDeclarationSyntax& node);

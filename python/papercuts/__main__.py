@@ -28,10 +28,10 @@ from papercuts.status import StatusWriter
 
 # Cut-family names, matching the prefix of each cut's type string from
 # Papercutter.cut_info() (the token before the first '('): "bitshrink",
-# "ternary(...)", "if(...)", "case(...)", "binop(...)". Used by --only-families
-# to restrict which families get scheduled/consolidated. Keep in sync with the
-# emplace_back type strings in cpp/src/papercuts.cpp (cutInfo).
-CUT_FAMILIES = ("bitshrink", "ternary", "if", "case", "binop")
+# "ternary(...)", "if(...)", "case(...)", "binop(...)", "force-const(...)". Used
+# by --only-families to restrict which families get scheduled/consolidated. Keep
+# in sync with the emplace_back type strings in cpp/src/papercuts.cpp (cutInfo).
+CUT_FAMILIES = ("bitshrink", "ternary", "if", "case", "binop", "force-const")
 
 
 def cut_family(ctype: str) -> str:
@@ -505,10 +505,11 @@ async def main():
             with open(f"{orig_dir}/{name}.sv", "w") as f:
                 f.write(print_tree(tree))
 
-    # `symbolic_ranges[def][signal]` = the (left, right) that signal's packed range
-    # evaluates to, so bit-shrink can narrow parameterized ranges
-    # (`logic [WIDTH-1:0] x;`). Empty => those stay uncut.
-    symbolic_ranges: dict[str, dict[str, tuple[int, int]]] = {}
+    # `symbolic_ranges[def][signal]` = the (left, right) each of that signal's packed
+    # dimensions evaluates to (outermost first), so bit-shrink can narrow
+    # parameterized ranges (`logic [WIDTH-1:0] x;`) -- every dimension, including
+    # those of multi-packed-dim vectors. Empty => those stay uncut.
+    symbolic_ranges: dict[str, dict[str, list[tuple[int, int]]]] = {}
     elab_blob_path = None
 
     if args.in_situ:
