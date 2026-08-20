@@ -16,13 +16,28 @@ import subprocess
 import asyncio
 
 import papercuts.chipper as chipper
-from papercuts.elaborator import elaborate_design, ElaborationError, EmitError
+from papercuts.elaborator import (
+    elaborate_design, build_compilation_from, ElaborationError, EmitError, make_parse_env,
+)
 from papercuts.utils import print_tree, status, set_verbose, Run
 from papercuts.ec import generate_jasper_tcl_script
 from papercuts.scope import blackboxable_definitions, build_graph
 from papercuts.backends import discover_backends, get_backend
 from papercuts.pypercuts import Papercutter, insert_muxes
 from papercuts.status import StatusWriter
+
+
+# Cut-family names, matching the prefix of each cut's type string from
+# Papercutter.cut_info() (the token before the first '('): "bitshrink",
+# "ternary(...)", "if(...)", "case(...)", "binop(...)", "force-const(...)". Used
+# by --only-families to restrict which families get scheduled/consolidated. Keep
+# in sync with the emplace_back type strings in cpp/src/papercuts.cpp (cutInfo).
+CUT_FAMILIES = ("bitshrink", "ternary", "if", "case", "binop", "force-const")
+
+
+def cut_family(ctype: str) -> str:
+    """Family name for a cut type string, e.g. 'binop(and,keep-left)' -> 'binop'."""
+    return ctype.split("(", 1)[0]
 
 
 # MARK: Module context
@@ -223,19 +238,13 @@ def write_papercuts_log(
 
 
 # MARK: cut plan
-def write_cut_plan(
-    plan_path: str, modules: list[ModuleCuts], blackboxed: "set[str] | None" = None
-) -> None:
+def write_cut_plan(plan_path: str, modules: list[ModuleCuts]) -> None:
     """Write the planned equivalence tests (one row per cut to be checked).
 
     Emitted after enumeration but before any FV run, so the full test plan --
     every cut and its type -- is visible up front, independent of whether -e is
     used. No-op cuts (byte-identical to the elaborated source) are never checked,
     so they are excluded from the rows and only counted in the header.
-
-    ``blackboxed`` (modules with no definition in the inputs, under
-    --allow-missing-modules) never appear as cut rows -- they have no body to cut
-    -- so they are recorded in a header comment for the permanent record.
     """
     planned = [
         (m.name, run.index, m.cut_infos[run.index][0], m.cut_infos[run.index][1])
@@ -265,11 +274,6 @@ def write_cut_plan(
             f.write("# by type: " + ", ".join(f"{t} {c}" for t, c in tally.items()) + "\n")
         if excluded:
             f.write(f"# excluded modules (never cut): {', '.join(excluded)}\n")
-        if blackboxed:
-            f.write(
-                f"# black-boxed modules (no definition in inputs): "
-                f"{', '.join(sorted(blackboxed))}\n"
-            )
         f.write(f"# {'module':<{w_mod}}  {'idx':>4}  {'type':<{w_type}}  {'line':>6}\n")
         for mod, idx, ctype, line in planned:
             f.write(f"  {mod:<{w_mod}}  {idx:>4}  {ctype:<{w_type}}  {line:>6}\n")
@@ -352,21 +356,59 @@ async def main():
         "('#' comments and blank lines ignored).",
     )
     parser.add_argument(
+        "--cut-only",
+        action="append",
+        metavar="NAME",
+        help="Enumerate/check cuts ONLY on modules whose name matches one of "
+        "these fnmatch globs; every other module is still elaborated and kept in "
+        "the golden source (so it provides real context) but is never cut. "
+        "Repeatable. The inverse of --exclude-module; use it to reduce one target "
+        "while keeping surrounding logic as context.",
+    )
+    parser.add_argument(
+        "-I",
+        "--incdir",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="Add an include-search directory (like +incdir) so inputs that "
+        "'`include' headers can be parsed. Repeatable.",
+    )
+    parser.add_argument(
+        "-D",
+        "--define",
+        action="append",
+        default=[],
+        metavar="NAME[=VALUE]",
+        help="Predefine a macro before preprocessing (like +define). Repeatable.",
+    )
+    parser.add_argument(
         "--no-default-excludes",
         action="store_true",
         help="Ignore the exclusions the selected backend recommends by default.",
     )
     parser.add_argument(
-        "--allow-missing-modules",
+        "--in-situ",
         action="store_true",
-        help="Accept an incomplete file list: instantiations of modules with no "
-        "definition in the inputs become black boxes (opaque FV boundaries) "
-        "instead of aborting. The original golden and elaborated sides are both "
-        "built from the same inputs, so the missing module is absent from both "
-        "and the equivalence gate compares like-for-like. Verification is then "
-        "modulo those boundaries. NOTE: this suppresses undefined-module errors "
-        "design-wide, so a typo'd or forgotten module silently becomes a black "
-        "box -- check the reported black-box list.",
+        help="Cut the original source in place: skip elaboration entirely, so "
+        "parameters are not concretized, generate loops are not unrolled, and a "
+        "module instantiated N times stays ONE definition instead of becoming N "
+        "specialized copies. Each cut therefore has to hold for every instance of "
+        "the definition it edits (the equivalence check enforces this for free, "
+        "since it elaborates at the design top), which yields fewer but "
+        "source-actionable cuts. A read-only elaboration is still used to find the "
+        "top and to learn signal widths for parameterized bit-shrinks; pass --top "
+        "to skip even that.",
+    )
+    parser.add_argument(
+        "--top",
+        default=None,
+        metavar="NAME",
+        help="Name of the design top. Only used with --in-situ, where it makes the "
+        "read-only elaboration optional: without it the top is discovered by "
+        "elaborating, with it a design that cannot be elaborated is still cuttable "
+        "(bit-shrinks on parameterized ranges are then skipped, since their real "
+        "widths are unknown).",
     )
     parser.add_argument(
         "--scope-reduce",
@@ -386,6 +428,16 @@ async def main():
         "(e.g. generate-loop junk like '0 * 10') to their folded value "
         "(default: on; use --no-fold-constants to emit the raw arithmetic).",
     )
+    parser.add_argument(
+        "--only-families",
+        metavar="LIST",
+        default=None,
+        help="Comma-separated list of cut families to enumerate/check; all "
+        "others are skipped entirely (not scheduled, not consolidated). Valid "
+        f"families: {', '.join(CUT_FAMILIES)}. E.g. '--only-families bitshrink' "
+        "does only (iterative) bit-shrinks; '--only-families bitshrink,binop' "
+        "does both. Default: all families.",
+    )
 
     # Two-phase parse: resolve the backend, let it add its own args, then parse.
     args, _ = parser.parse_known_args()
@@ -395,6 +447,32 @@ async def main():
 
     set_verbose(args.verbose)
 
+    # Resolve --only-families into a set (None = all families). Validate names up
+    # front so a typo fails fast instead of silently selecting zero cuts.
+    only_families: set[str] | None = None
+    if args.only_families is not None:
+        requested = [f.strip() for f in args.only_families.split(",") if f.strip()]
+        unknown = [f for f in requested if f not in CUT_FAMILIES]
+        if unknown:
+            parser.error(
+                f"--only-families: unknown family {unknown} "
+                f"(valid: {', '.join(CUT_FAMILIES)})"
+            )
+        only_families = set(requested)
+
+    if args.top and not args.in_situ:
+        parser.error("--top only applies to --in-situ; the elaborated front end "
+                     "discovers the top itself.")
+
+    if args.scope_reduce and args.in_situ:
+        # In situ, one definition is shared by all its instances, so `-bbox_m`
+        # would abstract away in-cone instances too -- both sides of the
+        # equivalence check would then agree trivially and report a false
+        # "proven". The cone analysis is only exact against the elaborated front
+        # end, which emits one uniquely named definition per instance.
+        parser.error("--scope-reduce requires the elaborated front end; it "
+                     "cannot be combined with --in-situ.")
+
     backend = backend_cls.from_args(args) if args.check_equivalence else None
 
     # Modules to keep in the golden source but never cut. Union of the user's
@@ -403,7 +481,8 @@ async def main():
     # names match exactly and globs (e.g. "lib_*") match families. These
     # patterns feed the elaborator's `ignore` (excluded modules are emitted
     # verbatim under their original names) and are matched again below, via
-    # is_excluded, against those same names to skip cutting them.
+    # is_excluded, against those same names to skip cutting them. Under
+    # --in-situ nothing is emitted or renamed, so they are only matched there.
     exclude_patterns: set[str] = set(args.exclude_module or [])
     if args.exclude_modules_file:
         with open(args.exclude_modules_file) as f:
@@ -413,6 +492,13 @@ async def main():
                     exclude_patterns.add(s)
     if backend is not None and not args.no_default_excludes:
         exclude_patterns |= backend.default_excluded_modules()
+
+    # --cut-only: fnmatch globs; only matching modules are cut. Empty => cut all
+    # (minus excludes). Include-dir / macro passthrough for parsing inputs that
+    # are not self-contained.
+    cut_only_patterns: set[str] = set(args.cut_only or [])
+    incdirs = list(args.incdir or [])
+    defines = list(args.define or [])
 
     # TODO: change this to based on the source file directory
     output_dir = "./outputs"
@@ -440,105 +526,166 @@ async def main():
     # output dir was just recreated, so this always starts empty.
     results_path = f"{output_dir}/{RESULTS_FILENAME}"
 
-    # MARK: Elaboration -- the canonical front end.
-    # Unroll generates, resolve parameters, and flatten hierarchy up front by
-    # re-emitting the whole design from a live slang elaboration. Excluded
-    # modules are emitted verbatim (opaque boundaries) so they reach the formal
-    # tool as their original source and parents instantiate them by their
-    # original name. Everything downstream (the FV gate and the cut pipeline)
-    # treats the elaborated source as canonical -- chipper.eval_modules
-    # concretization is no longer part of the flow.
-    status("Elaborating design (unroll + flatten + concretize)...")
-    try:
-        elab = elaborate_design(args.input_files, flatten=True, ignore=exclude_patterns,
-                                fold_constants=args.fold_constants,
-                                allow_missing=args.allow_missing_modules)
-    except (ElaborationError, EmitError) as e:
-        hint = ""
-        if not args.allow_missing_modules:
-            hint = (" If the file list is intentionally incomplete, re-run with "
-                    "--allow-missing-modules to black-box the absent modules.")
-        raise SystemExit(f"FATAL: elaboration failed: {e}{hint}")
-
-    if len(elab.tops) != 1:
-        raise SystemExit(
-            f"FATAL: expected exactly one top-level instance, got {elab.tops or 'none'}."
-        )
-    top_name = elab.top
-    status(f"Elaborated top: {top_name}")
-
-    # Surface black-boxed (missing-definition) modules. These are opaque FV
-    # boundaries on both sides of every check; listing them lets the user catch a
-    # typo'd/forgotten module that silently became a black box (see the
-    # --allow-missing-modules footgun note).
-    if elab.blackboxed:
-        status(
-            f"black-boxed {len(elab.blackboxed)} module(s) with no definition "
-            f"in the inputs: {', '.join(sorted(elab.blackboxed))}"
-        )
-
-    # The elaborated whole-design source is a single self-contained blob (all
-    # specialized submodules + verbatim boundaries in one file). Keep it in its
-    # own dir so it never pollutes the original-source library used by the gate.
-    elab_dir = f"{output_dir}/elab"
-    os.makedirs(elab_dir, exist_ok=True)
-    elab_blob_path = f"{elab_dir}/{top_name}_elaborated.sv"
-    with open(elab_blob_path, "w") as f:
-        f.write(elab.source)
-
-    # The original design, split one module per file, is the golden ("spec") side
-    # of the elaboration-equivalence gate below.
+    # The original design, split one module per file: the golden ("spec") side of
+    # the elaboration-equivalence gate below, and -- under --in-situ -- the cut
+    # spec library itself. Every consumer resolves modules by file stem, so one
+    # definition per name is required.
     orig_dir = f"{output_dir}/orig"
     os.makedirs(orig_dir, exist_ok=True)
-    for raw in (SyntaxTree.fromFile(f) for f in args.input_files):
+    orig_sm, orig_opts = make_parse_env(incdirs, defines)
+    raw_trees = [SyntaxTree.fromFile(f, orig_sm, orig_opts) for f in args.input_files]
+    orig_trees: list[tuple[SyntaxTree, str]] = []
+    defined_in: dict[str, str] = {}
+    for src, raw in zip(args.input_files, raw_trees):
         for name, tree in chipper.split_tree(raw):
+            if name in defined_in:
+                raise SystemExit(
+                    f"FATAL: module '{name}' is defined in both {defined_in[name]} "
+                    f"and {src}. Papercuts addresses modules by name; pass only one "
+                    f"definition of each (or exclude the duplicate)."
+                )
+            defined_in[name] = src
+            orig_trees.append((tree, name))
             with open(f"{orig_dir}/{name}.sv", "w") as f:
                 f.write(print_tree(tree))
 
-    # Canonical per-module sources = the elaborated blob, split one module per
-    # file. This replaces the old concretized-tree list and becomes the cut spec
-    # lib. split_tree yields (name, tree); the pipeline consumes (tree, name).
-    blob_tree = SyntaxTree.fromText(elab.source)
-    conc_trees = [(tree, name) for name, tree in chipper.split_tree(blob_tree)]
+    # `symbolic_ranges[def][signal]` = the (left, right) each of that signal's packed
+    # dimensions evaluates to (outermost first), so bit-shrink can narrow
+    # parameterized ranges (`logic [WIDTH-1:0] x;`) -- every dimension, including
+    # those of multi-packed-dim vectors. Empty => those stay uncut.
+    symbolic_ranges: dict[str, dict[str, list[tuple[int, int]]]] = {}
+    elab_blob_path = None
+    scope_graph = None   # cone-of-influence graph; elaborated front end only
 
-    def is_excluded(module_name: str) -> bool:
+    if args.in_situ:
+        # MARK: In-situ front end -- no elaboration, no rewriting.
+        # The original parameterized definitions ARE the canonical source, so
+        # orig_dir doubles as the cut spec lib. A definition is shared by all its
+        # instances, so a cut must hold for every one of them -- which the checks
+        # below enforce for free, since each elaborates at the design top.
+        conc_trees, ctree_dir = orig_trees, orig_dir
+        top_name = args.top
+        try:
+            comp = build_compilation_from(raw_trees)
+            symbolic_ranges = chipper.definition_signal_ranges(comp)
+            tops = [t.name for t in comp.getRoot().topInstances]
+        except Exception as e:
+            if top_name is None:
+                raise SystemExit(
+                    f"FATAL: could not elaborate to discover the top module ({e}). "
+                    f"Pass --top NAME to cut without elaborating at all."
+                )
+            status(f"WARNING: read-only elaboration failed ({e}); bit-shrink cuts "
+                   f"on parameterized ranges will be skipped.")
+        else:
+            if top_name is None:
+                if len(tops) != 1:
+                    raise SystemExit(
+                        f"FATAL: expected exactly one top-level instance, got "
+                        f"{tops or 'none'}. Pass --top NAME to choose one."
+                    )
+                top_name = tops[0]
+        if top_name not in defined_in:
+            raise SystemExit(f"FATAL: top module '{top_name}' is not among the inputs.")
+        # No renaming happens in situ, so a module can be left uncut on its own
+        # without dragging its subtree along (unlike the elaborated path below).
+        verbatim = {
+            n for _, n in conc_trees
+            if any(fnmatch.fnmatch(n, p) for p in exclude_patterns)
+        }
+        status(f"In-situ top: {top_name} ({len(conc_trees)} module definitions, "
+               f"not elaborated)")
+    else:
+        # MARK: Elaboration -- the canonical front end.
+        # Unroll generates, resolve parameters, and flatten hierarchy up front by
+        # re-emitting the whole design from a live slang elaboration. Excluded
+        # modules are emitted verbatim (opaque boundaries) so they reach the formal
+        # tool as their original source and parents instantiate them by their
+        # original name. Everything downstream (the FV gate and the cut pipeline)
+        # treats the elaborated source as canonical -- chipper.eval_modules
+        # concretization is no longer part of the flow.
+        status("Elaborating design (unroll + flatten + concretize)...")
+        try:
+            elab = elaborate_design(args.input_files, flatten=True, ignore=exclude_patterns,
+                                    fold_constants=args.fold_constants,
+                                    incdirs=incdirs, defines=defines)
+        except (ElaborationError, EmitError) as e:
+            raise SystemExit(f"FATAL: elaboration failed: {e}")
+
+        if len(elab.tops) != 1:
+            raise SystemExit(
+                f"FATAL: expected exactly one top-level instance, got {elab.tops or 'none'}."
+            )
+        top_name = elab.top
+        status(f"Elaborated top: {top_name}")
+
+        # The elaborated whole-design source is a single self-contained blob (all
+        # specialized submodules + verbatim boundaries in one file). Keep it in its
+        # own dir so it never pollutes the original-source library used by the gate.
+        elab_dir = f"{output_dir}/elab"
+        os.makedirs(elab_dir, exist_ok=True)
+        elab_blob_path = f"{elab_dir}/{top_name}_elaborated.sv"
+        with open(elab_blob_path, "w") as f:
+            f.write(elab.source)
+
+        # Canonical per-module sources = the elaborated blob, split one module per
+        # file. This replaces the old concretized-tree list and becomes the cut spec
+        # lib. split_tree yields (name, tree); the pipeline consumes (tree, name).
+        blob_tree = SyntaxTree.fromText(elab.source)
+        conc_trees = [(tree, name) for name, tree in chipper.split_tree(blob_tree)]
+
         # The elaborator emits an excluded module AND its whole subtree verbatim
         # (an opaque boundary), so the uncut set is exactly what it emitted
-        # verbatim -- not just the pattern-matched names. Skip cutting all of it.
-        return module_name in elab.verbatim
+        # verbatim -- not just the pattern-matched names.
+        verbatim = elab.verbatim
 
-    ctree_dir = f"{output_dir}/concrete_sources"
-    os.makedirs(ctree_dir, exist_ok=True)
+        ctree_dir = f"{output_dir}/concrete_sources"
+        os.makedirs(ctree_dir, exist_ok=True)
+        for tree, name in conc_trees:
+            with open(f"{ctree_dir}/{name}.sv", "w") as f:
+                f.write(print_tree(tree))
 
-    # Write the canonical (elaborated) per-module trees; this is the spec lib.
-    for tree, name in conc_trees:
-        with open(f"{ctree_dir}/{name}.sv", "w") as f:
-            f.write(print_tree(tree))
+        # Scope reduction: one dataflow graph over the canonical per-module
+        # sources -- the exact file set Jasper analyzes via -y, so the cones
+        # describe the netlist being checked. The elaborator emits one uniquely
+        # named module per instance, so a definition name here identifies a
+        # single instance and `elaborate -bbox_m` is exact. (-bbox_m also accepts
+        # wildcards; the mangled names are alphanumeric-and-underscore only, so
+        # they can never be read as a pattern.)
+        #
+        # Deliberately inside the elaborated branch: --in-situ shares one
+        # definition across every instance of a module, which would make -bbox_m
+        # abstract away in-cone logic. argparse rejects that combination, but
+        # keeping the build here makes the invariant structural rather than
+        # dependent on a check several hundred lines away.
+        if args.scope_reduce and backend is not None:
+            status("Building cone-of-influence graph for scope reduction...")
+            try:
+                scope_graph = build_graph(
+                    [f"{ctree_dir}/{n}.sv" for _, n in conc_trees],
+                    tops=[top_name],
+                    incdirs=incdirs,
+                    defines=defines,
+                )
+            except (ElaborationError, EmitError) as e:
+                # Degrade to full-design checks rather than kill the run: this
+                # source already passed elaboration above, so a failure here is a
+                # scope.py problem and must not cost the user their whole run.
+                status(f"WARNING: scope reduction disabled ({e})")
+                scope_graph = None
 
-    # Scope reduction: one dataflow graph over the canonical per-module sources
-    # -- the exact file set Jasper analyzes via -y, so the cones describe the
-    # netlist being checked. The elaborator emits one uniquely named module per
-    # instance, so a definition name here identifies a single instance and
-    # `elaborate -bbox_m` is exact. (-bbox_m also accepts wildcards; the
-    # elaborator's mangled names are alphanumeric-and-underscore only, so they
-    # can never be read as a pattern.)
-    scope_graph = None
-    if args.scope_reduce and backend is not None:
-        status("Building cone-of-influence graph for scope reduction...")
-        try:
-            scope_graph = build_graph(
-                [f"{ctree_dir}/{n}.sv" for _, n in conc_trees],
-                tops=[top_name],
-                allow_missing=args.allow_missing_modules,
-            )
-        except (ElaborationError, EmitError) as e:
-            # Degrade to full-design checks rather than kill the run: this
-            # source already passed elaboration above, so a failure here is a
-            # scope.py problem and must not cost the user their whole run.
-            status(f"WARNING: scope reduction disabled ({e})")
-            scope_graph = None
+        status("Elaboration complete.")
 
-    status("Elaboration complete.")
+    def is_excluded(module_name: str) -> bool:
+        return module_name in verbatim
+
+    def is_cut_target(module_name: str) -> bool:
+        # --cut-only: when set, enumerate cuts only on modules whose name matches
+        # one of the fnmatch globs. Non-matching modules stay in the golden source
+        # (real context) but are never cut. Empty => cut all.
+        if not cut_only_patterns:
+            return True
+        return any(fnmatch.fnmatch(module_name, p) for p in cut_only_patterns)
 
     # Make a directory for the final output sources
     consolidated_dir = f"{output_dir}/consolidated_sources"
@@ -604,8 +751,10 @@ async def main():
     # Both sides elaborate at the design top; the blob is self-contained so the
     # -y orig_dir search path is harmless. A non-proven verdict is fatal -- every
     # downstream cut is checked against the elaborated golden, so an unfaithful
-    # elaboration would silently invalidate the entire run.
-    if backend is not None:
+    # elaboration would silently invalidate the entire run. Vacuous under
+    # --in-situ, where the canonical source IS the original (the self-check above
+    # already covers that comparison), so it is skipped there.
+    if backend is not None and elab_blob_path is not None:
         status("FV gate: verifying elaborated design == original...")
         gate_dir = f"{elab_dir}/fv"
         os.makedirs(gate_dir, exist_ok=True)
@@ -642,10 +791,14 @@ async def main():
             )
         fv_gate_result = (getattr(gate_run, "verdict", None) or "proven").upper()
         status("FV gate passed: elaborated design == original.")
+    elif args.in_situ:
+        fv_gate_result = "N/A (in-situ)"
     else:
         status("FV gate skipped (no -e/backend); elaborated source is unverified.")
 
     if args.mux_rewrites:
+        # Bit muxes are sized from the same literal packed ranges bit-shrink uses,
+        # so under --in-situ they are only inserted for non-parameterized signals.
         status("Performing mux rewrites...")
         mux_dir = f"{output_dir}/muxed_sources"
         os.makedirs(mux_dir, exist_ok=True)
@@ -680,10 +833,11 @@ async def main():
         cur_dir = f"{output_dir}/{name}"  # created lazily, only when a cut is written
         is_top = name == top_name
 
-        if is_excluded(name):
+        if is_excluded(name) or not is_cut_target(name):
             # Left uncut: it stays in the golden source (already written to
             # ctree_dir) so cuts on modules that instantiate it still see the
-            # real logic, but we enumerate and check no cuts on it.
+            # real logic, but we enumerate and check no cuts on it. Reached either
+            # via --exclude-module (verbatim boundary) or --cut-only (non-target).
             modules.append(
                 ModuleCuts(
                     name=name,
@@ -703,6 +857,7 @@ async def main():
             ntree,
             shrink_with_intermediate=args.shrink_with_intermediate,
             binops_in_conditions_only=args.binops_in_conditions_only,
+            symbolic_ranges=symbolic_ranges.get(name, {}),
         )
         cut_infos = list(pc.cut_info())  # (type, line) aligned 1:1 with cut indices
 
@@ -718,6 +873,11 @@ async def main():
             bbox_modules=_module_bbox(scope_graph, name),
         )
         for idx in range(len(cut_infos)):
+            # --only-families: skip cuts outside the selected families. They are
+            # never scheduled, logged, or consolidated (everything downstream is
+            # driven by mod.runs).
+            if only_families is not None and cut_family(cut_infos[idx][0]) not in only_families:
+                continue
             run = Run(
                 top_module_path=f"{ctree_dir}/{top_name}.sv",
                 spec_lib_path=ctree_dir,
@@ -728,7 +888,7 @@ async def main():
                 # Copy: the cex re-check below swaps this list out per run, and
                 # these runs execute concurrently.
                 bbox_modules=list(mod.bbox_modules),
-            )
+                )
             mod.runs.append(run)
             all_runs.append(run)
         modules.append(mod)
@@ -772,14 +932,14 @@ async def main():
                 f"WARNING: {n_noop} no-op cut(s) detected (identical to elaborated "
                 f"source); excluded from FV. See {log_path}"
             )
-        write_cut_plan(plan_path, modules, blackboxed=elab.blackboxed)
+        write_cut_plan(plan_path, modules)
         write_papercuts_log(log_path, modules, checked=False, fv_gate=fv_gate_result)
         status(f"Enumeration-only (no -e). Cut summary written to {log_path}")
         return
 
     # -e path: the plan is written before any FV run, so it is a pre-run superset
     # (no-ops are only discovered as each cut is generated during checking).
-    write_cut_plan(plan_path, modules, blackboxed=elab.blackboxed)
+    write_cut_plan(plan_path, modules)
     status(
         f"Cut plan ({len(all_runs)} planned tests; no-ops detected during "
         f"checking) written to {plan_path}"
@@ -996,7 +1156,7 @@ async def main():
                     is_top=mod.is_top,
                     index=-1,
                     bbox_modules=mod.bbox_modules,
-                ),
+                        ),
             )
         )
 

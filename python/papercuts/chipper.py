@@ -45,6 +45,79 @@ def concretized_definition_names(comp: Compilation) -> dict[str, str]:
     }
 
 
+def _packed_dim_ranges(t) -> list[tuple[int, int]]:
+    """The (left, right) of every packed dimension of an integral packed type,
+    outermost dimension first: ``logic [A-1:0][B-1:0]`` -> ``[(A-1, 0), (B-1, 0)]``
+    and ``logic [7:0]`` -> ``[(7, 0)]``.
+
+    ``fixedRange`` only exposes the outermost dimension, so this descends through
+    ``elementType`` to capture the inner ones too. Without that, a multi-packed-dim
+    vector would surface just one range and its other dimensions could never be
+    bit-shrunk.
+    """
+    dims: list[tuple[int, int]] = []
+    while t.isIntegral and t.isPackedArray:
+        r = t.fixedRange
+        dims.append((r.left, r.right))
+        t = t.elementType
+    return dims
+
+
+def definition_signal_ranges(comp: Compilation) -> dict[str, dict[str, list[tuple[int, int]]]]:
+    """Map each module definition to ``{signal name: [(left, right), ...]}`` -- the
+    bounds each packed dimension actually evaluates to, outermost dimension first.
+
+    Feeds ``Papercutter(symbolic_ranges=...)``, which cannot bit-shrink a
+    parameterized declaration (``logic [WIDTH-1:0] x;``) from syntax alone: the
+    bounds give neither a width to stop at nor a direction to shrink in. Both
+    matter, because a reversed range is legal SV -- a placeholder ``parameter
+    WIDTH = 0`` makes that declaration ``[-1:0]``, two bits wide with its *left*
+    as the low end -- so narrowing the wrong end silently widens the signal.
+
+    Every packed dimension is recorded, so a multi-dimensional vector like
+    ``logic [A-1:0][B-1:0]`` can have each of its dimensions shrunk on that
+    dimension's own evaluated bounds, rather than the whole signal being left
+    uncut because a single range can't describe more than one dimension.
+
+    A definition instantiated with different parameters has a different range per
+    instance; the narrowest is kept -- per dimension independently -- since an
+    in-situ cut edits the one shared definition and so must be valid for every
+    instance of it.
+    """
+    ranges: dict[str, dict[str, list[tuple[int, int]]]] = {}
+
+    def _scope(scope, out: dict[str, list[tuple[int, int]]]) -> None:
+        for m in scope:
+            if isinstance(m, ast.InstanceSymbol):
+                continue  # child definitions are visited on their own
+            if isinstance(m, (ast.VariableSymbol, ast.NetSymbol)):
+                if m.type.isIntegral and m.type.isPackedArray:
+                    dims = _packed_dim_ranges(m.type)
+                    cur = out.get(m.name)
+                    if cur is None or len(cur) != len(dims):
+                        # First sighting (or -- structurally impossible but handled
+                        # defensively -- a differing dimension count across
+                        # instances): take the ranges as-is.
+                        out[m.name] = dims
+                    else:
+                        # Same signal seen in another instance: keep the narrower
+                        # width in each dimension independently, so the one shared
+                        # edit stays valid for the smallest instance of every dim.
+                        out[m.name] = [
+                            d if abs(d[0] - d[1]) < abs(c[0] - c[1]) else c
+                            for c, d in zip(cur, dims)
+                        ]
+            elif hasattr(m, "__iter__"):
+                _scope(m, out)  # generate/named blocks declare signals too
+
+    def _visitor(obj: Union[Token, SyntaxNode]) -> None:
+        if isinstance(obj, ast.InstanceSymbol):
+            _scope(obj.body, ranges.setdefault(obj.definition.name, {}))
+
+    comp.getRoot().visit(_visitor)
+    return ranges
+
+
 def collect_modules_cst(comp: Compilation) -> dict[str, SyntaxTree]:
     """Collects all module instances from the given compilation and returns a dictionary mapping their hierarchical paths (string) to their syntax trees."""
     modules = {}
@@ -260,6 +333,28 @@ def eval_modules(
     # DO REWRITES OVER DEFINITIONS FROM COMPILATION
 
 
+#: Include guard wrapped around the `$unit`-scope preamble that ``split_tree``
+#: replicates into every per-module file. Each split file must carry the preamble
+#: to parse standalone, but a formal tool analyzes the whole set into ONE global
+#: compilation unit (Jasper's `analyze -y` does), where N copies of the same
+#: declaration are N redefinition errors. The guard makes the copies collapse to
+#: one there -- exactly how the original RTL's `include header avoids the same
+#: collision -- while staying a no-op for single-file-compilation-unit tools like
+#: slang, which give each file its own scope and its own macro state.
+UNIT_SCOPE_GUARD = "PC_UNIT_SCOPE_DECLS"
+
+
+def _guarded(info_trees: list[str]) -> list[str]:
+    """Wrap the replicated `$unit` preamble in its include guard (no-op if empty)."""
+    if not info_trees:
+        return []
+    return (
+        [f"`ifndef {UNIT_SCOPE_GUARD}", f"`define {UNIT_SCOPE_GUARD}"]
+        + info_trees
+        + ["`endif"]
+    )
+
+
 def split_tree(tree: SyntaxTree) -> list[tuple[str, SyntaxTree]]:
 
     modules = []
@@ -280,7 +375,7 @@ def split_tree(tree: SyntaxTree) -> list[tuple[str, SyntaxTree]]:
 
     for module in raw_modules:
         modules.append(
-            (module[0], SyntaxTree.fromText("\n".join(info_trees + [module[1]])))
+            (module[0], SyntaxTree.fromText("\n".join(_guarded(info_trees) + [module[1]])))
         )
 
     return modules

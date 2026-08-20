@@ -76,14 +76,19 @@ endmodule
 """
 
 
-# `missing_ram` has no definition anywhere in the compilation. With
-# allow_missing=True it elaborates to an UninstantiatedDefSymbol, whose ports
-# were never resolved -- so every connected signal must be treated as both
-# driving and driven, keeping `d -> q` reachable.
+# An instance declared opaque (`--exclude-module`) has its body ignored, so every
+# input must be assumed to reach every output. `ram` is written with NO internal
+# path from `in` to `out`, so `d -> q` at the top is reachable *only* through the
+# conservative opaque treatment -- which makes the assertion prove the opaque
+# path did the work, rather than the module's own logic.
 OPAQUE = """
+module ram (input logic clk, input logic in, output logic out);
+    assign out = clk;
+endmodule
+
 module top (input logic clk, input logic d, output logic q);
     logic w;
-    missing_ram u_ram (.clk(clk), .in(d), .out(w));
+    ram u_ram (.clk(clk), .in(d), .out(w));
     assign q = w;
 endmodule
 """
@@ -212,27 +217,43 @@ def test_control_dependence_and_lvalue_split():
 
 
 def test_opaque_instance_connects_all_ports():
-    """A module with no definition must still carry dataflow.
+    """An opaque instance must conservatively carry input -> output dataflow.
 
-    Regression: ``UninstantiatedDefSymbol.getPortConnections()`` returns bare
-    ``Expression``s (InstanceSymbols.h:338) while ``InstanceSymbol`` returns
-    ``PortConnection`` wrappers (:118). Unwrapping the latter shape blindly made
-    every connection resolve to ``None``, so unknown-module instances
-    contributed no edges at all -- a silently *under*-approximated cone, which
-    is the direction that yields false "proven" verdicts.
+    Regression: port connections come back in different shapes depending on the
+    owning symbol (``slang/ast/symbols/InstanceSymbols.h``) -- ``InstanceSymbol``
+    wraps them in ``PortConnection`` (:118) while ``PrimitiveInstanceSymbol``
+    returns bare ``Expression``s (:338). Unwrapping one shape blindly made every
+    connection resolve to ``None``, so opaque instances contributed no edges at
+    all -- a silently *under*-approximated cone, which is the direction that
+    yields false "proven" verdicts.
+
+    The negative case is asserted alongside, because without it the test would
+    still pass if opaque handling were removed entirely and `ram`'s own logic
+    happened to connect the two.
     """
-    g = _graph(OPAQUE, "opaque", allow_missing=True)
+    g = _graph(OPAQUE, "opaque", opaque_defs=["ram"])
 
-    assert g.opaque, "the undefined instance was not recorded as opaque"
+    assert g.opaque, "the excluded instance was not recorded as opaque"
 
     d = next(p for p in g.ports["top"] if p.name == "d")
     q = next(p for p in g.ports["top"] if p.name == "q")
-    # d reaches q only by passing through the undefined `missing_ram`.
+    # d reaches q only by passing through the opaque `ram`, which has no
+    # internal in -> out path of its own.
     assert q.node in g.reachable([d.node]), (
-        "no dataflow through the undefined module; its port connections were "
+        "no dataflow through the opaque module; its port connections were "
         "dropped"
     )
     assert d.node in g.reachable([q.node], forward=False)
+
+    # Same design, not opaque: `ram` really does break the path, so the edge
+    # above can only have come from the opaque treatment.
+    g2 = _graph(OPAQUE, "opaque")
+    d2 = next(p for p in g2.ports["top"] if p.name == "d")
+    q2 = next(p for p in g2.ports["top"] if p.name == "q")
+    assert q2.node not in g2.reachable([d2.node]), (
+        "d reaches q without opaque handling -- `ram` is not the barrier this "
+        "test assumes, so the positive assertion proves nothing"
+    )
 
 
 def test_net_initializer_and_primitive():

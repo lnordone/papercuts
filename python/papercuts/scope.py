@@ -35,9 +35,11 @@ elaboration it considers erroneous, and real RTL trips errors that have no
 bearing on dataflow -- ``MissingTimeScale`` is pure timing metadata, for
 instance. Suppressing those is safe. Suppressing an error that means part of the
 design failed to elaborate is not: the missing logic yields a cone that is too
-*small*, which is the direction that produces false "proven" verdicts. Prefer
-``--allow-missing-modules`` for absent definitions, since that routes them
-through the conservative opaque-instance path instead of dropping them.
+*small*, which is the direction that produces false "proven" verdicts. In
+particular, do not suppress ``UnknownModule`` to push past an absent definition
+-- an instance whose body never elaborated contributes no edges at all. Supply
+the missing source, or name the module with ``--exclude-module`` so it routes
+through the conservative opaque-instance path instead.
 """
 
 from __future__ import annotations
@@ -650,10 +652,16 @@ def report_diagnostics(comp, ignored=()):
 
 
 def build_graph(
-    files, *, opaque_defs=(), allow_missing=False, ignore_diags=(), tops=()
+    files, *, opaque_defs=(), ignore_diags=(), tops=(), incdirs=(), defines=()
 ) -> ScopeGraph:
-    """Elaborate ``files`` and build the dataflow graph for the whole design."""
-    comp = build_compilation(list(files), allow_missing=allow_missing)
+    """Elaborate ``files`` and build the dataflow graph for the whole design.
+
+    ``incdirs`` and ``defines`` mirror the elaborator's ``-I``/``-D``, for
+    designs whose sources only parse with include paths or predefined macros.
+    Neither is needed when the files come from ``outputs/concrete_sources``,
+    which the elaborator has already preprocessed.
+    """
+    comp = build_compilation(list(files), incdirs=incdirs, defines=defines)
     if report_diagnostics(comp, resolve_diag_codes(ignore_diags)):
         raise ElaborationError("input has compilation errors; aborting")
     graph = ScopeGraph.build(comp, opaque_defs=opaque_defs, tops=tops)
@@ -713,8 +721,12 @@ def main() -> int:
              "roots' ports count as design I/O.",
     )
     parser.add_argument(
-        "--allow-missing-modules", action="store_true",
-        help="treat instantiations of undefined modules as black boxes",
+        "-I", "--incdir", action="append", default=[], metavar="DIR",
+        help="add an include-search directory (like +incdir). Repeatable.",
+    )
+    parser.add_argument(
+        "-D", "--define", action="append", default=[], metavar="NAME[=VALUE]",
+        help="predefine a macro before preprocessing (like +define). Repeatable.",
     )
     parser.add_argument(
         "--ignore-diag", action="append", default=[], metavar="NAME",
@@ -732,9 +744,10 @@ def main() -> int:
         graph = build_graph(
             args.files,
             opaque_defs=args.exclude_module,
-            allow_missing=args.allow_missing_modules,
             ignore_diags=args.ignore_diag,
             tops=args.top,
+            incdirs=args.incdir,
+            defines=args.define,
         )
     except ElaborationError as e:
         print(f"Error: {e}", file=sys.stderr)
